@@ -30,9 +30,11 @@ def _init_firebase():
         return
 
     creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    if not creds_path or not os.path.exists(creds_path):
+    firebase_json = os.getenv("FIREBASE_JSON")
+    
+    if not firebase_json and (not creds_path or not os.path.exists(creds_path)):
         logger.warning(
-            f"Firebase credentials not found at '{creds_path}'. "
+            f"Firebase credentials not found. "
             "Firebase features (Auth, Firestore) will be disabled."
         )
         return
@@ -40,8 +42,14 @@ def _init_firebase():
     try:
         import firebase_admin
         from firebase_admin import credentials, firestore
+        import json
 
-        cred = credentials.Certificate(creds_path)
+        if firebase_json:
+            cred_dict = json.loads(firebase_json)
+            cred = credentials.Certificate(cred_dict)
+        else:
+            cred = credentials.Certificate(creds_path)
+            
         _firebase_app = firebase_admin.initialize_app(cred)
         _firestore_client = firestore.client()
         logger.info("Firebase Admin SDK initialized successfully.")
