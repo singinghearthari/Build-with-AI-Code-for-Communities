@@ -15,7 +15,10 @@ from typing import Optional
 
 logger = logging.getLogger("TTSService")
 
-CACHE_DIR = Path(os.environ.get("TTS_CACHE_DIR", "data/tts_cache"))
+if os.environ.get("VERCEL"):
+    CACHE_DIR = Path("/tmp/tts_cache")
+else:
+    CACHE_DIR = Path(os.environ.get("TTS_CACHE_DIR", "data/tts_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Unicode ranges for Indian language detection

@@ -43,29 +43,31 @@ def setup_logger():
     console_handler.setFormatter(JSONFormatter())
     logger.addHandler(console_handler)
 
-    os.makedirs("logs", exist_ok=True)
+    # Vercel has a read-only filesystem, so we skip file logs
+    if not os.environ.get("VERCEL"):
+        os.makedirs("logs", exist_ok=True)
 
-    file_handler = RotatingFileHandler(
-        "logs/seed_ai.log", encoding="utf-8",
-        maxBytes=10 * 1024 * 1024, backupCount=5,
-    )
-    file_handler.setFormatter(JSONFormatter())
-    logger.addHandler(file_handler)
+        file_handler = RotatingFileHandler(
+            "logs/seed_ai.log", encoding="utf-8",
+            maxBytes=10 * 1024 * 1024, backupCount=5,
+        )
+        file_handler.setFormatter(JSONFormatter())
+        logger.addHandler(file_handler)
 
-    error_handler = RotatingFileHandler(
-        "logs/errors.log", encoding="utf-8",
-        maxBytes=10 * 1024 * 1024, backupCount=3,
-    )
-    error_handler.setLevel(logging.ERROR)
-    error_handler.setFormatter(JSONFormatter())
-    logger.addHandler(error_handler)
+        error_handler = RotatingFileHandler(
+            "logs/errors.log", encoding="utf-8",
+            maxBytes=10 * 1024 * 1024, backupCount=3,
+        )
+        error_handler.setLevel(logging.ERROR)
+        error_handler.setFormatter(JSONFormatter())
+        logger.addHandler(error_handler)
 
-    correlation_handler = RotatingFileHandler(
-        "logs/execution_traces.log", encoding="utf-8",
-        maxBytes=10 * 1024 * 1024, backupCount=5,
-    )
-    correlation_handler.setLevel(logging.INFO)
-    correlation_handler.setFormatter(JSONFormatter())
-    logger.addHandler(correlation_handler)
+        correlation_handler = RotatingFileHandler(
+            "logs/execution_traces.log", encoding="utf-8",
+            maxBytes=10 * 1024 * 1024, backupCount=5,
+        )
+        correlation_handler.setLevel(logging.INFO)
+        correlation_handler.setFormatter(JSONFormatter())
+        logger.addHandler(correlation_handler)
 
     return logger

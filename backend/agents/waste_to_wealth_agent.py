@@ -1,14 +1,12 @@
 """
 SEED AI — Waste to Wealth Agent (Production)
 Identifies revenue opportunities from agricultural waste streams.
-Uses Hugging Face SigLIP2 for image-based waste classification when an image is provided.
 Returns structured AgentResult — never fakes success.
 """
 from typing import Dict, Any
 from pydantic import BaseModel
 from .base_agent import BaseAgent
 from utils.dataset_manager import DatasetManager
-from services.hf_vision_analyzer import HFVisionAnalyzer
 
 
 class WasteOpportunity(BaseModel):
@@ -36,7 +34,6 @@ class WasteToWealthAgent(BaseAgent):
     def __init__(self):
         super().__init__("WasteToWealth")
         self.dataset_manager = DatasetManager()
-        self.hf = HFVisionAnalyzer.get_instance()
 
     def _process(self, context: Dict[str, Any]) -> tuple:
         location = context.get("location", "")
@@ -45,28 +42,11 @@ class WasteToWealthAgent(BaseAgent):
         query = context.get("text_query", "")
         self.log_execution(f"Analyzing waste-to-wealth for crop={crop}, location={location}")
 
-        waste_classification = None
-        image_bytes = context.get("image_bytes")
-        image_base64 = context.get("image_base64")
-        raw_bytes = image_bytes or (__import__("base64").b64decode(image_base64) if image_base64 else None)
-        if raw_bytes and self.hf.is_available():
-            waste_classification = self.hf.classify_waste(raw_bytes)
-            self.log_execution(f"Waste image classification: {waste_classification.get('status')}")
-
         tool_calls = ["Knowledge Base (crops)", "Knowledge Base (government_schemes)"]
-        if waste_classification and waste_classification["status"] == "success":
-            tool_calls.append("HF Waste Classifier (SigLIP2)")
+        waste_context = ""
 
         crop_data = self.dataset_manager.query("crops", crop)
         scheme_data = self.dataset_manager.query("government_schemes", "waste")
-
-        waste_context = ""
-        if waste_classification and waste_classification["status"] == "success":
-            top_waste = waste_classification["predictions"][:3]
-            waste_context = "Waste material detected in image:\n" + "\n".join(
-                f"  - {p['label']} (confidence: {p['score']*100:.1f}%)"
-                for p in top_waste
-            )
 
         prompt = f"""
 You are an expert in agricultural waste management and circular economy, specializing in Indian farming.

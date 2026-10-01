@@ -45,7 +45,7 @@ class VisionAgent(BaseAgent):
 
     def __init__(self):
         super().__init__("Vision")
-        self.default_model = "gemini-2.0-flash"
+        self.default_model = gemini_service.DEFAULT_MODEL
         self.hybrid = HybridVisionService.get_instance()
 
     def _process(self, context: Dict[str, Any]) -> tuple:

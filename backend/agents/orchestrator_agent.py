@@ -224,7 +224,7 @@ EMOJI_MAP = {
     "soil_nutrient": "🧪", "entomologist": "🐛", "irrigation": "💧",
 }
 
-AGENT_TIMEOUT_SECONDS = 60
+AGENT_TIMEOUT_SECONDS = 10
 
 
 class OrchestratorAgent(BaseAgent):
@@ -314,25 +314,27 @@ class OrchestratorAgent(BaseAgent):
                         ts(), status="failed",
                     )
 
-            # ── Step 2: Load memory ────────────────────────────────────
-            yield self._event("📂 Loading Farm Memory", ts(), status="running")
+            # ── Step 2: Load memory (concurrent with routing) ──────────
             mem_start = time.time()
-            farm_memory = await asyncio.to_thread(
-                self.memory.process, {"user_id": user_id, "memory_action": "retrieve"}
+            memory_future = asyncio.create_task(
+                asyncio.to_thread(self.memory.process, {"user_id": user_id, "memory_action": "retrieve"})
             )
-            mem_latency = (time.time() - mem_start) * 1000
-            if farm_memory and farm_memory.get("status") not in ("skipped", "no_memory_found"):
-                context["farm_memory"] = farm_memory
-                yield self._event(
-                    "📂 Farm memory loaded", ts(),
-                    status="completed", latency_ms=mem_latency,
-                    data_sources=["Firestore"],
-                )
+
+            crop_present = bool(context.get("crop") and context.get("crop") != "Unknown" and str(context.get("crop")).strip() != "")
+            loc_present = bool(context.get("location") and context.get("location") != "Unknown" and str(context.get("location")).strip() != "")
+
+            if not (crop_present and loc_present):
+                yield self._event("📂 Loading Farm Memory", ts(), status="running")
+                farm_memory = await memory_future
+                mem_latency = (time.time() - mem_start) * 1000
+                if farm_memory and farm_memory.get("status") not in ("skipped", "no_memory_found"):
+                    context["farm_memory"] = farm_memory
+                    yield self._event("📂 Farm memory loaded", ts(), status="completed", latency_ms=mem_latency, data_sources=["Firestore"])
+                else:
+                    yield self._event("📂 No previous memory found", ts(), status="completed", latency_ms=mem_latency)
             else:
-                yield self._event(
-                    "📂 No previous memory found", ts(),
-                    status="completed", latency_ms=mem_latency,
-                )
+                farm_memory = None
+                yield self._event("📂 Farm profile active", ts(), status="completed", latency_ms=0)
 
             # ── Step 3: Context inference ──────────────────────────────
             yield self._event("⚡ Checking context details for missing fields...", ts(), status="running")
@@ -354,32 +356,65 @@ class OrchestratorAgent(BaseAgent):
             )
 
             # ── Step 5: Execute Tier 1 concurrently ───────────────────
-            tier1_timeout = 60.0
+            tier1_timeout = 25.0
             yield self._event(
                 f"⚡ Executing Tier-1 core ({len(tier1_agents)} agents in parallel)",
                 ts(), status="running",
             )
 
             tier1_start = time.time()
-            tier1_results = await asyncio.wait_for(
-                asyncio.gather(
-                    *[self._execute_agent_with_retry(name, context, trace_id) for name in tier1_agents],
-                    return_exceptions=True,
-                ),
-                timeout=tier1_timeout,
-            )
+            async def _staggered_exec(idx: int, name: str):
+                if idx > 0:
+                    await asyncio.sleep(idx * 0.04)
+                return await self._execute_agent_with_retry(name, context, trace_id)
+
+            tier1_tasks = {
+                name: asyncio.create_task(_staggered_exec(i, name))
+                for i, name in enumerate(tier1_agents)
+            }
+            try:
+                done_t1, pending_t1 = await asyncio.wait(
+                    tier1_tasks.values(),
+                    timeout=tier1_timeout,
+                )
+            except Exception as wait_err:
+                self.logger.warning(f"Tier-1 wait error: {wait_err}")
+                done_t1, pending_t1 = set(), set(tier1_tasks.values())
+
+            for task in pending_t1:
+                task.cancel()
+
             tier1_latency = (time.time() - tier1_start) * 1000
 
-            for name, result in zip(tier1_agents, tier1_results):
-                if isinstance(result, Exception):
-                    ar = AgentResult(
-                        status=AgentStatus.FAILED,
-                        agent_name=name,
-                        execution_time_ms=0,
-                        error=str(result),
-                    )
+            for name in tier1_agents:
+                task = tier1_tasks[name]
+                if task in done_t1 and not task.cancelled():
+                    try:
+                        res = task.result()
+                        if isinstance(res, Exception):
+                            ar = AgentResult(
+                                status=AgentStatus.FAILED,
+                                agent_name=name,
+                                execution_time_ms=0,
+                                error=str(res),
+                            )
+                        else:
+                            ar = res
+                    except Exception as res_err:
+                        ar = AgentResult(
+                            status=AgentStatus.FAILED,
+                            agent_name=name,
+                            execution_time_ms=0,
+                            error=str(res_err),
+                        )
                 else:
-                    ar = result
+                    ar = AgentResult(
+                        status=AgentStatus.TIMEOUT,
+                        agent_name=name,
+                        execution_time_ms=round(tier1_timeout * 1000, 1),
+                        error=f"Agent '{name}' timed out after {tier1_timeout}s",
+                    )
+
                 agent_results[name] = ar
                 agent_events.append({
                     "agent": name,
@@ -438,9 +473,14 @@ class OrchestratorAgent(BaseAgent):
                     "timestamp": ts(),
                 }
 
-                # Reflection on Tier-1 fusion (if not degraded)
+                # Reflection on Tier-1 fusion (only if low confidence < 60% or critical risk)
                 critical_failed = [a for a in failed_agents if a not in NON_CRITICAL_AGENTS]
-                if not critical_failed and not fusion.is_degraded:
+                should_reflect = (
+                    not critical_failed 
+                    and not fusion.is_degraded 
+                    and (fusion.confidence_score < 60.0 or fusion.risk_level == "Critical")
+                )
+                if should_reflect:
                     yield self._event("🔍 Running Reflection", ts(), status="running")
                     reflect_start = time.time()
                     fusion = await self._reflect_on_decision(fusion, context)
@@ -468,41 +508,93 @@ class OrchestratorAgent(BaseAgent):
                     ],
                 )
 
-            # ── Step 7: Truly fire-and-forget Tier 2 enrichment (non-blocking) ─
-            # Tier-2 runs in the background — does NOT delay the final result.
+            # ── Step 7: Tier 2 enrichment (Timeline, Schemes, Waste, Market) ─
             if tier2_agents:
                 yield self._event(
                     f"🚀 Launching Tier-2 enrichment: {', '.join(tier2_agents)}",
                     ts(), status="running",
                     metadata={"agents": tier2_agents, "tier": 2},
                 )
+                t2_tasks = {
+                    name: asyncio.create_task(self._execute_agent_with_retry(name, context, trace_id))
+                    for name in tier2_agents
+                }
+                try:
+                    done_t2, pending_t2 = await asyncio.wait(t2_tasks.values(), timeout=12.0)
+                except Exception as t2_err:
+                    self.logger.warning(f"Tier-2 wait error: {t2_err}")
+                    done_t2, pending_t2 = set(), set(t2_tasks.values())
 
-                async def _run_and_store_tier2():
-                    try:
-                        for name in tier2_agents:
-                            ar = await self._execute_agent_with_retry(name, context, trace_id)
-                            agent_results[name] = ar
-                            agent_events.append({
-                                "agent": name,
-                                "status": ar.status.value,
-                                "success": ar.succeeded,
-                                "latency_ms": ar.execution_time_ms,
-                                "latency_sec": round(ar.execution_time_ms / 1000, 3),
-                                "tokens": ar.tokens_used,
-                                "confidence": ar.confidence,
-                                "error": ar.error,
-                                "tier": 2,
-                            })
-                            if ar.succeeded:
-                                succeeded_agents.append(name)
-                                total_agent_tokens += ar.tokens_used
-                                context[f"{name}_result"] = ar.data
+                for task in pending_t2:
+                    task.cancel()
+
+                for name in tier2_agents:
+                    task = t2_tasks[name]
+                    if task in done_t2 and not task.cancelled():
+                        try:
+                            res = task.result()
+                            if isinstance(res, Exception):
+                                ar = AgentResult(
+                                    status=AgentStatus.FAILED,
+                                    agent_name=name,
+                                    execution_time_ms=0,
+                                    error=str(res),
+                                )
                             else:
-                                failed_agents.append(name)
-                    except Exception as e:
-                        self.logger.error(f"Tier-2 enrichment error: {e}")
+                                ar = res
+                        except Exception as res_err:
+                            ar = AgentResult(
+                                status=AgentStatus.FAILED,
+                                agent_name=name,
+                                execution_time_ms=0,
+                                error=str(res_err),
+                            )
+                    else:
+                        ar = AgentResult(
+                            status=AgentStatus.TIMEOUT,
+                            agent_name=name,
+                            execution_time_ms=12000,
+                            error=f"Tier-2 agent '{name}' timed out",
+                        )
 
-                asyncio.ensure_future(_run_and_store_tier2())
+                    agent_results[name] = ar
+                    agent_events.append({
+                        "agent": name,
+                        "status": ar.status.value,
+                        "success": ar.succeeded,
+                        "latency_ms": ar.execution_time_ms,
+                        "latency_sec": round(ar.execution_time_ms / 1000, 3),
+                        "tokens": ar.tokens_used,
+                        "confidence": ar.confidence,
+                        "error": ar.error,
+                        "tier": 2,
+                    })
+                    if ar.succeeded:
+                        succeeded_agents.append(name)
+                        total_agent_tokens += ar.tokens_used
+                        context[f"{name}_result"] = ar.data
+                        yield self._event(
+                            f"{EMOJI_MAP.get(name, '⚙️')} {name.replace('_', ' ').title()} ✓",
+                            ts(), agent=name, latency_ms=ar.execution_time_ms,
+                            status="completed",
+                            metadata={"tokens": ar.tokens_used, "confidence": round(ar.confidence, 1), "tier": 2},
+                        )
+                    else:
+                        failed_agents.append(name)
+                        error_short = (ar.error or "Unknown error")[:120]
+                        yield self._event(
+                            f"{EMOJI_MAP.get(name, '⚙️')} {name.replace('_', ' ').title()} ✗ — {error_short}",
+                            ts(), agent=name, latency_ms=ar.execution_time_ms,
+                            status="failed", error=ar.error, metadata={"tier": 2},
+                        )
+
+            if farm_memory is None and 'memory_future' in locals():
+                try:
+                    farm_memory = await asyncio.wait_for(asyncio.shield(memory_future), timeout=1.0)
+                    if farm_memory and farm_memory.get("status") not in ("skipped", "no_memory_found"):
+                        context["farm_memory"] = farm_memory
+                except Exception:
+                    pass
 
             # ── Step 8: Firestore persistence (batched, non-blocking) ─
             step9_start = time.time()
@@ -593,16 +685,17 @@ class OrchestratorAgent(BaseAgent):
 
         except Exception as pipeline_error:
             self.logger.error(f"Pipeline error: {pipeline_error}\n{traceback.format_exc()}")
+            err_str = str(pipeline_error).strip() or type(pipeline_error).__name__
             if fusion is None:
                 fusion = FusionResult(
-                    summary=f"An unexpected error occurred during execution: {str(pipeline_error)[:200]}",
-                    recommended_actions=["Please retry the simulation with a more specific query."],
+                    summary=f"Execution notice: {err_str[:200]}",
+                    recommended_actions=["Please retry the simulation or verify your network connection."],
                     confidence_score=0,
                     confidence_label="Low",
                     risk_level="Unknown",
                     is_degraded=True,
                     failed_agents=failed_agents or [],
-                    degradation_reasons=[f"Pipeline error: {str(pipeline_error)[:100]}"],
+                    degradation_reasons=[f"Pipeline error: {err_str[:100]}"],
                 )
 
         # ── Finalize: emit trace and final result ──────────────────────
@@ -764,35 +857,77 @@ class OrchestratorAgent(BaseAgent):
             tier1 = list(TIER1_CORE) + ["disease_prediction", "market"]
             return (tier1, list(TIER2_ENRICHMENT), "ensemble")
 
-        # Auto: Tier 1 core + LLM-resolved specialists + Tier 2
+        # Auto: Tier 1 core + Fast Deterministic / Specialist Routing + Tier 2
         context["routed_mode"] = "auto"
-        additional = self._resolve_with_llm(context)
-        tier1 = list(TIER1_CORE) + ["market"] + additional
-        return (tier1, list(TIER2_ENRICHMENT), "auto")
+        additional = self._resolve_specialists_fast(context)
+        query_lower = (context.get("text_query") or "").lower()
+        if any(kw in query_lower for kw in MARKET_KEYWORDS):
+            tier1 = list(TIER1_CORE) + ["market"] + additional
+            tier2 = list(TIER2_ENRICHMENT)
+        else:
+            tier1 = list(TIER1_CORE) + additional
+            tier2 = list(TIER2_ENRICHMENT) + ["market"]
+        return (tier1, tier2, "auto")
+
+    def _resolve_specialists_fast(self, context: Dict[str, Any]) -> List[str]:
+        """
+        Ultra-fast (<0.1ms) deterministic specialist resolution using agricultural keyword taxonomy.
+        Eliminates blocking LLM roundtrips.
+        """
+        query_lower = (context.get("text_query") or "").lower()
+        specialists: Set[str] = set()
+
+        pest_keywords = {
+            "pest", "pests", "bug", "bugs", "worm", "worms", "borer", "aphid", "caterpillar", "insect", "insects", "beetle",
+            "mite", "mites", "whitefly", "thrips", "larvae", "grub", "infest", "infestation", "locust", "leafhopper",
+            "stem borer", "bollworm", "armyworm", "cutworm"
+        }
+        if any(kw in query_lower for kw in pest_keywords):
+            specialists.add("entomologist")
+
+        water_keywords = {
+            "water", "irrigation", "drip", "sprinkler", "moisture", "dry", "watering",
+            "drought", "wilting", "waterlogging", "flood", "subsurface",
+            "rain", "rainfall", "rainy", "shower", "monsoon", "humid", "humidity"
+        }
+        if any(kw in query_lower for kw in water_keywords):
+            specialists.add("irrigation")
+
+        disease_keywords = {
+            "disease", "blight", "rot", "mildew", "spot", "spots", "yellowing", "wilt", "fungus",
+            "rust", "canker", "scab", "mosaic", "curl", "lesion", "spore", "fungal", "bacterial",
+            "spray", "fungicide", "pesticide", "cure", "protect", "prevent", "damage", "attack",
+            "infection", "leaf", "leaves"
+        }
+        if any(kw in query_lower for kw in disease_keywords):
+            specialists.add("disease_prediction")
+
+        crop_keywords = {
+            "what to plant", "which crop", "recommend crop", "crop selection", "best crop",
+            "next season", "alternate crop", "crop rotation", "profitable crop", "sow"
+        }
+        if any(kw in query_lower for kw in crop_keywords):
+            specialists.add("crop_prediction")
+
+        waste_keywords = {
+            "waste", "stubble", "residue", "husk", "straw", "stalk", "bagasse", "biochar",
+            "compost", "biogas"
+        }
+        if any(kw in query_lower for kw in waste_keywords):
+            specialists.add("waste_to_wealth")
+
+        if specialists:
+            return [s for s in specialists if s in self._agent_map]
+
+        if context.get("crop") and context.get("crop") != "Unknown":
+            return ["disease_prediction"]
+
+        return []
 
     def _resolve_with_llm(self, context: Dict[str, Any]) -> List[str]:
-        """
-        Lightweight LLM call to decide if specialist agents (vision, entomologist, irrigation,
-        disease_prediction, crop_prediction) are needed beyond Tier 1 core.
-        """
-        if not gemini_service.is_available():
-            return []
-
-        prompt = (
-            f"Query: {context.get('text_query', '')}\n"
-            f"Crop: {context.get('crop', '')}\n"
-            f"Location: {context.get('location', '')}\n"
-            "Decide if any specialists are needed. Valid: vision, entomologist, irrigation, disease_prediction, crop_prediction. "
-            "Return ONLY a JSON array of strings. Empty array if none."
-        )
-        try:
-            result = gemini_service.generate(prompt=prompt, temperature=0.1)
-            import json as _json
-            extra = _json.loads(result.text.strip().strip("`").strip())
-            if isinstance(extra, list):
-                return [a for a in extra if a in self._agent_map]
-        except Exception:
-            pass
+        """Fast fallback: returns disease_prediction for known crops without blocking."""
+        if context.get("crop") and context.get("crop") != "Unknown":
+            return ["disease_prediction"]
         return []
 
     # ── Tier 1 Execution (concurrent gather) ────────────────────────────
@@ -908,15 +1043,11 @@ class OrchestratorAgent(BaseAgent):
                     return result
                 if attempt == 0 and self._is_transient_error(result.error):
                     self.logger.info(f"Retrying agent {name} after transient failure...")
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.3)
                     continue
                 return result
             except asyncio.TimeoutError:
                 self.evaluator.log_agent_execution(trace_id, name, False, AGENT_TIMEOUT_SECONDS, {"error": "timeout"})
-                if attempt == 0:
-                    self.logger.warning(f"Agent {name} timed out, retrying...")
-                    await asyncio.sleep(1)
-                    continue
                 return AgentResult(
                     status=AgentStatus.TIMEOUT,
                     agent_name=name,
@@ -925,9 +1056,9 @@ class OrchestratorAgent(BaseAgent):
                 )
             except Exception as e:
                 self.evaluator.log_agent_execution(trace_id, name, False, 0, {"error": str(e)})
-                if attempt == 0:
-                    self.logger.info(f"Agent {name} exception, retrying: {e}")
-                    await asyncio.sleep(1)
+                if attempt == 0 and self._is_transient_error(str(e)):
+                    self.logger.info(f"Agent {name} transient exception, retrying: {e}")
+                    await asyncio.sleep(0.3)
                     continue
                 return AgentResult(
                     status=AgentStatus.FAILED,
@@ -997,9 +1128,30 @@ class OrchestratorAgent(BaseAgent):
         succeeded: List[str],
         failed: List[str],
     ) -> FusionResult:
-        successful_data = {
-            name: ar.data for name, ar in agent_results.items() if ar.succeeded
-        }
+        concise_data = {}
+        for name, ar in agent_results.items():
+            if ar.succeeded and ar.data:
+                d = ar.data
+                if isinstance(d, dict):
+                    entry = {}
+                    for key in [
+                        "disease", "confidence", "weather_risk", "spray_safe", "rain_probability",
+                        "temperature", "humidity", "irrigation_needed", "estimated_total_cost",
+                        "budget_compliant", "best_value_option", "cheapest_option",
+                        "top_deficiency", "soil_health_score", "predicted_diseases", "reasoning",
+                        "summary", "immediate_action", "treatment"
+                    ]:
+                        if key in d:
+                            val = d[key]
+                            if isinstance(val, dict):
+                                entry[key] = {k: v for k, v in val.items() if k in ["name", "cost_estimate_inr", "disease_name", "action"]}
+                            elif isinstance(val, list):
+                                entry[key] = val[:2]
+                            else:
+                                entry[key] = val
+                    concise_data[name] = entry if entry else {k: str(v)[:120] for k, v in list(d.items())[:4]}
+                else:
+                    concise_data[name] = str(d)[:200]
 
         if succeeded:
             avg_confidence = sum(
@@ -1028,7 +1180,7 @@ class OrchestratorAgent(BaseAgent):
             f"Budget: ₹{context.get('budget', 'Not specified')} | "
             f"Location: {context.get('location', 'Unknown')} | "
             f"Crop: {context.get('crop', 'Unknown')}\n"
-            f"Agent data: {successful_data}\n"
+            f"Agent Findings: {concise_data}\n"
             f"Failed agents: {failed}\n"
             "Merge evidence into one coherent recommendation. "
             "Resolve conflicts (rain vs spray → delay). Respect budget. Prioritize safety. "
@@ -1037,7 +1189,8 @@ class OrchestratorAgent(BaseAgent):
         )
         try:
             response = await self.async_call_llm(prompt, schema=LLMFusionSchema)
-            llm_result = LLMFusionSchema.model_validate_json(response.text)
+            clean_text = gemini_service.extract_clean_json(response.text)
+            llm_result = LLMFusionSchema.model_validate_json(clean_text)
 
             fusion = FusionResult(
                 summary=llm_result.summary,
@@ -1065,7 +1218,7 @@ class OrchestratorAgent(BaseAgent):
         except Exception as e:
             self.logger.error(f"Fusion failed: {e}")
             self.logger.info("Falling back to local (non-LLM) decision fusion")
-            return self._local_fusion(successful_data, agent_results, context, succeeded, failed, is_degraded)
+            return self._local_fusion(concise_data, agent_results, context, succeeded, failed, is_degraded)
 
     def _local_fusion(
         self,
@@ -1153,15 +1306,16 @@ class OrchestratorAgent(BaseAgent):
 
     async def _reflect_on_decision(self, fusion: FusionResult, context: Dict[str, Any]) -> FusionResult:
         prompt = (
-            f"Budget: ₹{context.get('budget', 'Unknown')}\n"
-            f"Location: {context.get('location', 'Unknown')}\n\n"
-            f"Recommendation:\n{fusion.model_dump_json()}\n\n"
-            "Check: 1) Budget compliance 2) Spray safety vs rain 3) Contradictions 4) Missing critical info. "
-            "If safe, return unchanged. If issues found, revise and lower confidence. Return ONLY valid JSON."
+            f"Farmer Request: {context.get('text_query', '')} | Budget: ₹{context.get('budget', 'Unknown')} | Location: {context.get('location', 'Unknown')}\n"
+            f"Proposed Summary: {fusion.summary}\n"
+            f"Actions: {fusion.recommended_actions[:4]}\n\n"
+            "Quick sanity check: 1) Budget compliance 2) Spray safety vs rain 3) Any severe contradictions. "
+            "Return ONLY valid JSON."
         )
         try:
             response = await self.async_call_llm(prompt, schema=LLMFusionSchema)
-            revised_llm = LLMFusionSchema.model_validate_json(response.text)
+            clean_text = gemini_service.extract_clean_json(response.text)
+            revised_llm = LLMFusionSchema.model_validate_json(clean_text)
 
             fusion.summary = revised_llm.summary
             fusion.recommended_actions = revised_llm.recommended_actions

@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+logs/
+.pytest_cache/
+yolo11n.pt
+*.pt

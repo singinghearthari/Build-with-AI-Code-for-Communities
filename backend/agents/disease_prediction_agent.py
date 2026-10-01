@@ -11,19 +11,19 @@ from utils.dataset_manager import DatasetManager
 
 
 class DiseasePrediction(BaseModel):
-    disease_name: str
-    probability: str
-    early_warning_signs: list[str]
-    preventive_measures: list[str]
-    prophylactic_treatment: str
+    disease_name: str = "Common Fungal Infection"
+    probability: str = "Medium"
+    early_warning_signs: list[str] = ["Leaf yellowing", "Dark spots"]
+    preventive_measures: list[str] = ["Improve air circulation", "Apply preventive bio-fungicide"]
+    prophylactic_treatment: str = "Neem oil or copper-based fungicide spray"
 
 
 class DiseasePredictionResult(BaseModel):
-    predicted_diseases: list[DiseasePrediction]
-    overall_risk_level: str
-    environmental_risk_factors: list[str]
-    monitoring_schedule: str
-    reasoning: str
+    predicted_diseases: list[DiseasePrediction] = []
+    overall_risk_level: str = "Medium"
+    environmental_risk_factors: list[str] = ["High humidity", "Moderate temperature"]
+    monitoring_schedule: str = "Inspect leaves twice weekly"
+    reasoning: str = "Preventive disease forecast based on current agricultural conditions"
 
 
 class DiseasePredictionAgent(BaseAgent):

@@ -88,17 +88,21 @@ class MemoryAgent(BaseAgent):
 
     def _retrieve_farm_memory(self, user_id: str) -> Dict[str, Any]:
         self.log_execution(f"Retrieving farm memory for {user_id}")
-        try:
-            doc = self.db.collection("farm_memory").document(user_id).get()
-            if doc.exists:
-                return doc.to_dict()
-            return {"status": "no_memory_found"}
-        except Exception as e:
-            self.logger.error(f"Memory retrieval failed: {e}")
-            return {"status": "error", "error": str(e)}
+        def _fetch():
+            try:
+                doc = self.db.collection("farm_memory").document(user_id).get()
+                if doc.exists:
+                    return doc.to_dict()
+                return {"status": "no_memory_found"}
+            except Exception as e:
+                self.logger.error(f"Memory retrieval failed: {e}")
+                return {"status": "error", "error": str(e)}
+
+        return self._get_cached_or_fetch(f"farm_memory:{user_id}", _fetch, ttl=60)
 
     def _update_farm_memory(self, user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         self.log_execution(f"Updating farm memory for {user_id}")
+        self._invalidate_cache(f"farm_memory:{user_id}")
         try:
             data["updated_at"] = datetime.now(timezone.utc).isoformat()
             self.db.collection("farm_memory").document(user_id).set(data, merge=True)

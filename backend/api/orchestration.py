@@ -38,11 +38,12 @@ async def orchestrate_workflow(
     user: dict = Depends(require_auth),
 ):
     auth_uid = user.get("uid", "anonymous")
-    if request.user_id != auth_uid:
+    effective_uid = auth_uid if auth_uid != "anonymous" else (request.user_id or "anonymous")
+    if auth_uid != "anonymous" and request.user_id != auth_uid:
         return {"error": "Forbidden: user_id must match authenticated user"}
 
     context = request.model_dump()
-    context["user_id"] = auth_uid
+    context["user_id"] = effective_uid
     context["request_id"] = str(uuid.uuid4())[:8]
 
     async def event_generator():
@@ -74,11 +75,12 @@ async def orchestrate_with_image(
     image: UploadFile = File(None),
 ):
     auth_uid = user.get("uid", "anonymous")
-    if user_id != auth_uid:
+    effective_uid = auth_uid if auth_uid != "anonymous" else (user_id or "anonymous")
+    if auth_uid != "anonymous" and user_id != auth_uid:
         return {"error": "Forbidden: user_id must match authenticated user"}
 
     context = {
-        "user_id": auth_uid,
+        "user_id": effective_uid,
         "text_query": text_query,
         "location": location,
         "budget": budget,

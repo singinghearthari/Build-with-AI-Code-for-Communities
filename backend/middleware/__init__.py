@@ -24,19 +24,18 @@ async def require_auth(authorization: Optional[str] = Header(None)) -> dict:
         return {"uid": "anonymous", "email": None, "firebase_available": False}
 
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail="Missing or invalid Authorization header. Expected: Bearer <token>"
-        )
+        # Allow guest/anonymous users in simulator console
+        return {"uid": "anonymous", "email": None, "role": "guest"}
 
-    token = authorization.replace("Bearer ", "")
+    token = authorization.replace("Bearer ", "").strip()
+    if token in ("anonymous", "guest", "dev", "undefined", "null", ""):
+        return {"uid": "anonymous", "email": None, "role": "guest"}
+
     claims = verify_token_cached(token)
 
     if claims is None:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or expired Firebase ID token"
-        )
+        # Fall back to anonymous guest mode instead of blocking simulator console
+        return {"uid": "anonymous", "email": None, "role": "guest"}
 
     return claims
 

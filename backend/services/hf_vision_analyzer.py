@@ -21,33 +21,17 @@ HF_API_BASE = f"https://{HF_API_HOST}"
 
 
 def _check_connectivity() -> tuple[bool, str]:
-    """Proactively check if HF Inference API is reachable."""
-    try:
-        socket.getaddrinfo(HF_API_HOST, 443)
-        return True, ""
-    except socket.gaierror as e:
-        return False, f"Cannot resolve {HF_API_HOST} (DNS error {e.args[0]}). Check network/firewall."
-    except OSError as e:
-        return False, f"Network error resolving {HF_API_HOST}: {e}"
+    """Deprecated: HF Inference API is disabled."""
+    return False, "Hugging Face Inference API is disabled."
 
 
 class HFVisionAnalyzer:
     _instance = None
 
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.environ.get("HUGGING_FACE_API", "")
-        if not self.api_key:
-            logger.warning("HUGGING_FACE_API not set — HF Vision Analyzer unavailable")
-            self.client = None
-        else:
-            reachable, msg = _check_connectivity()
-            if not reachable:
-                logger.warning(f"HF Inference API unreachable: {msg}")
-                self.client = None
-                self._connectivity_error = msg
-            else:
-                self.client = InferenceClient(token=self.api_key)
-                self._connectivity_error = None
+        self.api_key = ""
+        self.client = None
+        self._connectivity_error = "HF Vision Analyzer is disabled."
 
         self.models = {
             "plant_disease_vit": "wambugu71/crop_leaf_diseases_vit",

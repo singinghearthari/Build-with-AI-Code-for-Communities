@@ -20,7 +20,6 @@ from services.firebase_service import (
     is_available as firebase_available,
 )
 from services import gemini_service
-from services.hf_vision_analyzer import HFVisionAnalyzer
 from services.hybrid_vision_service import HybridVisionService
 from services.weather_service import WeatherService
 from services.market_service import MarketService
@@ -44,11 +43,9 @@ def health_check():
     """
     firebase_status = firebase_health()
     gemini_ok = gemini_service.is_available()
-    hf = HFVisionAnalyzer.get_instance()
-    hf_ok = hf.is_available()
     firestore_ok = firebase_status.get("firestore", False)
-    overall = "healthy" if (gemini_ok or hf_ok) else "degraded"
-    if not gemini_ok and not hf_ok and not firestore_ok:
+    overall = "healthy" if gemini_ok else "degraded"
+    if not gemini_ok and not firestore_ok:
         overall = "unhealthy"
 
     return {
@@ -68,16 +65,12 @@ def health_check():
             "model": gemini_service.DEFAULT_MODEL,
             "error": gemini_service.get_init_error(),
         },
-        "huggingface": {
-            "available": hf_ok,
-            "vision": hf_ok,
-        },
         "firebase": firebase_status,
         "features": {
             "function_calling": gemini_ok,
             "parallel_execution": True,
             "streaming": True,
-            "vision": gemini_ok or hf_ok,
+            "vision": gemini_ok,
             "memory": firestore_ok,
             "storage": True,
         },
@@ -92,22 +85,16 @@ def health_check_deep():
     """
     firebase_status = firebase_health()
     gemini_status = gemini_service.health_check()
-    hf = HFVisionAnalyzer.get_instance()
 
     gemini_ok = gemini_status.get("available", False)
-    hf_ok = hf.is_available()
     firestore_ok = firebase_status.get("firestore", False)
-    overall = "healthy" if (gemini_ok or hf_ok) else "degraded"
-    if not gemini_ok and not hf_ok and not firestore_ok:
+    overall = "healthy" if gemini_ok else "degraded"
+    if not gemini_ok and not firestore_ok:
         overall = "unhealthy"
 
     return {
         "status": overall,
         "gemini": gemini_status,
-        "huggingface": {
-            "available": hf_ok,
-            "vision": hf_ok,
-        },
         "firebase": firebase_status,
     }
 
@@ -120,7 +107,6 @@ def diagnostics():
     """
     env_checks = {
         "GEMINI_API_KEY": bool(os.getenv("GEMINI_API_KEY")),
-        "HUGGING_FACE_API": bool(os.getenv("HUGGING_FACE_API")),
         "GOOGLE_APPLICATION_CREDENTIALS": bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS")),
         "OPENWEATHER_API_KEY": bool(os.getenv("OPENWEATHER_API_KEY")),
         "DATA_GOV_IN_API_KEY": bool(os.getenv("DATA_GOV_IN_API_KEY")),

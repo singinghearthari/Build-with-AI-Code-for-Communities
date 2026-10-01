@@ -42,7 +42,7 @@ class HybridVisionService:
             result["timing"]["openrouter_ms"] = round((time.time() - step_start) * 1000, 1)
             gemini_result = self._gemini_fallback(image_bytes, crop)
             result["expert_analysis"] = gemini_result.get("analysis", {})
-            result["expert_model"] = "gemini-2.0-flash (fallback)"
+            result["expert_model"] = f"{gemini_service.DEFAULT_MODEL} (fallback)"
 
         result["timing"]["total_ms"] = round((time.time() - pipeline_start) * 1000, 1)
         result["status"] = "success"

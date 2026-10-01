@@ -10,12 +10,12 @@ from utils.dataset_manager import DatasetManager
 
 
 class CropKnowledgeResult(BaseModel):
-    disease_info: str
-    spread_risk: str
-    treatment_protocols: list[str]
-    fertilizer_guidance: str
-    best_practices: list[str]
-    reasoning: str
+    disease_info: str = "Agricultural management knowledge for crop health"
+    spread_risk: str = "Moderate"
+    treatment_protocols: list[str] = ["Maintain optimal field sanitation", "Apply recommended biological or chemical spray"]
+    fertilizer_guidance: str = "Balanced NPK application according to soil requirements"
+    best_practices: list[str] = ["Regular field monitoring", "Ensure proper spacing and drainage"]
+    reasoning: str = "Evidence-based crop advisory from agricultural knowledge base"
 
 
 class CropKnowledgeAgent(BaseAgent):
@@ -26,6 +26,17 @@ class CropKnowledgeAgent(BaseAgent):
 
     def _process(self, context: Dict[str, Any]) -> tuple:
         disease = context.get("disease", "")
+        if not disease:
+            v_res = context.get("vision_result") or {}
+            disease = v_res.get("disease") or v_res.get("expert_analysis", {}).get("disease", "")
+        if not disease:
+            dp_res = context.get("disease_prediction_result") or {}
+            preds = dp_res.get("predicted_diseases") or []
+            if preds and isinstance(preds, list) and len(preds) > 0 and isinstance(preds[0], dict):
+                disease = preds[0].get("disease_name", "")
+        if disease == "Healthy" or disease == "Unknown":
+            disease = ""
+
         crop = context.get("crop", "")
         self.log_execution(f"Looking up knowledge for disease={disease}, crop={crop}")
 

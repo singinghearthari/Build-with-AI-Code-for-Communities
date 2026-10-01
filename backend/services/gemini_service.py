@@ -38,7 +38,37 @@ _init_error: Optional[str] = None
 
 _key_cooldowns: dict[int, float] = {}
 _key_cooldown_lock = threading.Lock()
-KEY_COOLDOWN_SECONDS = 30
+KEY_COOLDOWN_SECONDS = 3.0
+COOLDOWN_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".gemini_cooldown_cache.json")
+
+
+def _load_cooldown_cache():
+    try:
+        if os.path.exists(COOLDOWN_CACHE_FILE):
+            with open(COOLDOWN_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                now = time.time()
+                for k_str, expiry in data.items():
+                    if expiry > now:
+                        _key_cooldowns[int(k_str)] = expiry
+            active = len([k for k, exp in _key_cooldowns.items() if exp > time.time()])
+            if active > 0:
+                logger.info(f"Loaded {active} active key cooldowns from persistent cache")
+    except Exception as e:
+        logger.debug(f"Failed to load key cooldown cache: {e}")
+
+
+def _save_cooldown_cache():
+    try:
+        now = time.time()
+        active = {str(k): exp for k, exp in _key_cooldowns.items() if exp > now}
+        with open(COOLDOWN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(active, f)
+    except Exception as e:
+        logger.debug(f"Failed to save key cooldown cache: {e}")
+
+
+_load_cooldown_cache()
 
 API_KEY_ENV_VARS = [
     "GEMINI_API_KEY",
@@ -47,14 +77,36 @@ API_KEY_ENV_VARS = [
     "GEMINI_API_KEY3",
     "GEMINI_API_KEY4",
     "GEMINI_API_KEY5",
-    "GEMINI_API_KEY6",
-    "GEMINI_API_KEY7",
-    "GEMINI_API_KEY8",
-    "GEMINI_API_KEY9",
-    "GEMINI_API_KEY10",
 ]
 
-DEFAULT_MODEL = "gemini-2.0-flash"
+DEFAULT_MODEL = "gemini-3.1-flash-lite"
+FALLBACK_MODELS = [
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+]
+VISION_MODELS = [
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash",
+]
+
+
+def extract_clean_json(text: str) -> str:
+    """Extract pure JSON from model response, stripping any markdown backticks or commentary."""
+    if not text:
+        return "{}"
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
+        t = re.sub(r"\s*```$", "", t)
+    match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", t)
+    if match:
+        return match.group(0).strip()
+    return t.strip()
 
 SAFETY_SETTINGS = [
     types.SafetySetting(
@@ -78,58 +130,48 @@ SAFETY_SETTINGS = [
 
 class AsyncRateLimiter:
     """
-    Thread-safe rate limiter for Gemini API.
-    Uses threading.Lock (cross-event-loop-safe) + asyncio.sleep for non-blocking waits.
-    Never sleeps while holding the lock.
+    High-performance thread-safe sliding-window rate limiter with burst capability.
+    Allows concurrent bursts for parallel agent execution while strictly enforcing
+    the sliding 60-second quota across the API key pool.
     """
 
-    def __init__(self, max_per_minute: int = 4):
+    def __init__(self, max_per_minute: int = 60):
         self.max_per_minute = max_per_minute
-        self.min_interval = 60.0 / max_per_minute if max_per_minute > 0 else 60.0
         self._timestamps: list[float] = []
         self._lock = threading.Lock()
 
-    def _check_wait_time(self) -> float:
-        """Non-blocking: returns seconds to wait, or 0 if ready to proceed."""
+    def _acquire_or_wait(self) -> float:
+        """Atomically checks if slot is available; returns seconds to wait or 0 if slot acquired."""
         with self._lock:
             now = time.time()
             self._timestamps = [t for t in self._timestamps if now - t < 60.0]
             if len(self._timestamps) >= self.max_per_minute:
                 oldest = self._timestamps[0]
-                return 60.0 - (now - oldest) + 1.0
-            if self._timestamps:
-                last = self._timestamps[-1]
-                elapsed = now - last
-                if elapsed < self.min_interval:
-                    return self.min_interval - elapsed
-            self._timestamps.append(time.time())
+                return max(60.0 - (now - oldest) + 0.05, 0.05)
+            self._timestamps.append(now)
             return 0.0
 
     async def wait_if_needed(self):
         """Async wait — never blocks the event loop during sleep."""
-        wait = self._check_wait_time()
-        if wait > 0:
-            logger.info(f"Rate limiter: waiting {wait:.1f}s (at {self.max_per_minute} RPM limit)")
+        while True:
+            wait = self._acquire_or_wait()
+            if wait <= 0:
+                break
+            logger.info(f"Rate limiter: waiting {wait:.2f}s (at {self.max_per_minute} RPM limit)")
             await asyncio.sleep(wait)
-            with self._lock:
-                self._timestamps.append(time.time())
 
     def sync_wait_if_needed(self):
-        """Sync wait — safe to call from any thread (uses time.sleep)."""
-        wait = self._check_wait_time()
-        if wait > 0:
-            logger.info(f"Rate limiter: waiting {wait:.1f}s (sync, at {self.max_per_minute} RPM limit)")
+        """Sync wait — safe to call from any thread."""
+        while True:
+            wait = self._acquire_or_wait()
+            if wait <= 0:
+                break
+            logger.info(f"Rate limiter: waiting {wait:.2f}s (sync, at {self.max_per_minute} RPM limit)")
             time.sleep(wait)
-            with self._lock:
-                self._timestamps.append(time.time())
 
-
-_rate_limiter = AsyncRateLimiter(max_per_minute=4)
-
-# Global concurrency semaphore: limits parallel Gemini requests
-# Matches available key count so all keys can be utilized simultaneously
-_gemini_concurrency = threading.Semaphore(3)
-_gemini_concurrency_max = 3
+_rate_limiter = AsyncRateLimiter(max_per_minute=90)
+_gemini_concurrency = threading.Semaphore(10)
+_gemini_concurrency_max = 10
 
 
 def _check_groq_available() -> bool:
@@ -181,25 +223,31 @@ def _collect_api_keys() -> List[str]:
         if key and not key.startswith("AIzaSyBk_placeholder"):
             if key not in keys:
                 keys.append(key)
+                logger.info(f"Loaded key from {env_var} (first 12 chars: {key[:12]}...)")
             else:
                 logger.info(f"Skipping duplicate key from {env_var}")
-    logger.info(f"Collected {len(keys)} unique API keys")
+    logger.info(f"Collected {len(keys)} unique Gemini API keys")
     return keys
 
 
 def _is_key_on_cooldown(index: int) -> bool:
     with _key_cooldown_lock:
         expiry = _key_cooldowns.get(index)
-        if expiry and time.time() < expiry:
+        now = time.time()
+        if expiry and now < expiry:
             return True
         if expiry:
             del _key_cooldowns[index]
+            _save_cooldown_cache()
         return False
 
 
-def _mark_key_cooldown(index: int):
+def _mark_key_cooldown(index: int, duration: float = KEY_COOLDOWN_SECONDS):
+    if index < 0:
+        return
     with _key_cooldown_lock:
-        _key_cooldowns[index] = time.time() + KEY_COOLDOWN_SECONDS
+        _key_cooldowns[index] = time.time() + duration
+        _save_cooldown_cache()
 
 
 def _get_available_client_indices() -> List[int]:
@@ -209,20 +257,21 @@ def _get_available_client_indices() -> List[int]:
     ]
 
 
+_key_rotation_lock = threading.Lock()
+_round_robin_idx = 0
+
+
 def _rotate_key():
-    global _current_key_index
-    available = _get_available_client_indices()
-    if not available:
-        # Don't clear cooldowns — prevents infinite retry loop on daily quota exhaustion.
-        # The caller (generate functions) will fall through to g4f and then raise.
-        return
-    
-    if _current_key_index in available:
-        current_pos = available.index(_current_key_index)
-        next_pos = (current_pos + 1) % len(available)
-    else:
-        next_pos = 0
-    _current_key_index = available[next_pos]
+    global _current_key_index, _round_robin_idx
+    with _key_rotation_lock:
+        valid_indices = [i for i, c in enumerate(_clients) if c is not None]
+        if not valid_indices:
+            return
+        available = [i for i in valid_indices if not _is_key_on_cooldown(i)]
+        if not available:
+            return
+        _round_robin_idx = (_round_robin_idx + 1) % len(available)
+        _current_key_index = available[_round_robin_idx]
 
 
 def init_gemini() -> None:
@@ -244,11 +293,15 @@ def init_gemini() -> None:
     _clients = []
     for idx, key in enumerate(_api_keys):
         try:
-            client = genai.Client(api_key=key)
+            http_opts = types.HttpOptions(
+                timeout=10000,
+                retry_options=types.HttpRetryOptions(attempts=1),
+            )
+            client = genai.Client(api_key=key, http_options=http_opts)
             _clients.append(client)
-            logger.info(f"Gemini client {idx + 1}/{len(_api_keys)} initialized.")
+            logger.info(f"Gemini client {idx + 1}/{len(_api_keys)} initialized (key: {key[:12]}...).")
         except Exception as e:
-            logger.warning(f"Gemini client {idx + 1} initialization failed: {e}")
+            logger.warning(f"Gemini client {idx + 1} initialization failed for key {key[:12]}...: {e}")
             _clients.append(None)
 
     healthy = sum(1 for c in _clients if c is not None)
@@ -257,33 +310,39 @@ def init_gemini() -> None:
     else:
         logger.info(f"{healthy}/{len(_clients)} Gemini clients ready.")
         _init_error = None
-        total_rpm = healthy * 15
-        set_rate_limit(total_rpm)
-        set_concurrency(healthy)
-        logger.info(f"Rate limit set to {total_rpm} RPM across {healthy} keys")
+        safe_rpm = max(healthy * 15, 60)
+        set_rate_limit(safe_rpm)
+        set_concurrency(max(healthy, 6))
+        logger.info(f"Rate limit set to {safe_rpm} RPM across {healthy} keys")
 
     _initialized = True
 
 
-def get_client() -> Optional[genai.Client]:
+def get_client_with_index() -> Tuple[Optional[genai.Client], int]:
     if not _initialized:
         init_gemini()
     if not _clients:
-        return None
-    
-    # True connection pooling: Load balance by rotating key on EVERY request
-    _rotate_key()
-    
-    # Skip keys on cooldown — rotate until we find one that's available
-    for _ in range(len(_clients)):
-        idx = _current_key_index
-        if not _is_key_on_cooldown(idx):
-            client = _clients[idx]
-            if client is not None:
-                return client
-        _rotate_key()
-    
-    return None
+        return None, -1
+
+    global _current_key_index, _round_robin_idx
+    with _key_rotation_lock:
+        valid_indices = [i for i, c in enumerate(_clients) if c is not None]
+        if not valid_indices:
+            return None, -1
+
+        available = [i for i in valid_indices if not _is_key_on_cooldown(i)]
+        if not available:
+            return None, -1
+
+        _round_robin_idx = (_round_robin_idx + 1) % len(available)
+        chosen_idx = available[_round_robin_idx]
+        _current_key_index = chosen_idx
+        return _clients[chosen_idx], chosen_idx
+
+
+def get_client() -> Optional[genai.Client]:
+    client, _ = get_client_with_index()
+    return client
 
 
 def get_current_key_index() -> int:
@@ -373,16 +432,19 @@ def _handle_rate_limit_error(error: Exception) -> None:
         time.sleep(wait)
 
 
-GROQ_MODEL = "llama-3.1-70b-versatile"
+GROQ_MODELS = [
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+]
 
 
 def _groq_fallback(
     prompt: Any,
     schema: Optional[Any] = None,
-    model: str = GROQ_MODEL,
+    models: list = GROQ_MODELS,
 ) -> Optional[GenerationResult]:
     """Fallback generator using Groq when Gemini limits are reached.
-    Returns None if Groq key is not set or call fails."""
+    Tries multiple models sequentially. Returns None if all fail."""
     groq_api_key = os.getenv("GROQ_API_KEY")
     if not groq_api_key:
         logger.warning("GROQ_API_KEY not set — skipping Groq fallback")
@@ -390,136 +452,181 @@ def _groq_fallback(
     if not _groq_available:
         logger.warning("groq SDK not installed — skipping Groq fallback")
         return None
-    logger.warning(f"Using Groq ({model}) fallback due to Gemini limits...")
-    try:
-        from groq import Groq
-        client = Groq(api_key=groq_api_key)
-        messages = []
 
-        prompt_text = prompt
-        if isinstance(prompt, list):
-            prompt_text = next((item for item in prompt if isinstance(item, str)), "Please analyze the input.")
+    prompt_text = prompt
+    if isinstance(prompt, list):
+        prompt_text = next((item for item in prompt if isinstance(item, str)), "Please analyze the input.")
 
-        if schema:
-            if hasattr(schema, "model_json_schema"):
-                schema_dict = schema.model_json_schema()
-                schema_str = json.dumps(schema_dict, indent=2)
-                sys_msg = (
-                    "You must return ONLY a raw valid JSON object. "
-                    "Do not use markdown code blocks like ```json. "
-                    f"Your JSON must strictly match this schema:\n{schema_str}"
+    messages = []
+    if schema:
+        if hasattr(schema, "model_json_schema"):
+            schema_dict = schema.model_json_schema()
+            schema_str = json.dumps(schema_dict, indent=2)
+            sys_msg = (
+                "You must return ONLY a raw valid JSON object. "
+                "Do not use markdown code blocks like ```json. "
+                f"Your JSON must strictly match this schema:\n{schema_str}"
+            )
+            messages.append({"role": "system", "content": sys_msg})
+
+    messages.append({"role": "user", "content": str(prompt_text)})
+
+    for model in models:
+        for attempt in range(2):
+            logger.info(f"Using high-speed Groq ({model}) fallback (attempt {attempt + 1})...")
+            try:
+                from groq import Groq
+                client = Groq(api_key=groq_api_key)
+                start = time.time()
+                extra_kwargs = {}
+                if schema:
+                    extra_kwargs["response_format"] = {"type": "json_object"}
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.2,
+                    max_tokens=800,
+                    **extra_kwargs
                 )
-                messages.append({"role": "system", "content": sys_msg})
+                result_text = response.choices[0].message.content or ""
+                latency_ms = (time.time() - start) * 1000
 
-        messages.append({"role": "user", "content": str(prompt_text)})
+                if schema:
+                    result_text = result_text.strip("` \n")
+                    if result_text.startswith("json\n"):
+                        result_text = result_text[5:]
+                    import re as _re
+                    json_match = _re.search(r'\{.*\}', result_text, _re.DOTALL)
+                    if json_match:
+                        result_text = json_match.group(0)
 
-        start = time.time()
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0.2,
-        )
-        result_text = response.choices[0].message.content or ""
-        latency_ms = (time.time() - start) * 1000
+                usage = response.usage
+                prompt_tokens = usage.prompt_tokens if usage else 0
+                output_tokens = usage.completion_tokens if usage else 0
 
-        if schema:
-            result_text = result_text.strip("` \n")
-            if result_text.startswith("json\n"):
-                result_text = result_text[5:]
+                return GenerationResult(
+                    text=result_text,
+                    prompt_tokens=prompt_tokens,
+                    output_tokens=output_tokens,
+                    latency_ms=latency_ms,
+                    model=f"{model} (groq fallback)"
+                )
+            except Exception as e:
+                err_str = str(e)
+                if ("429" in err_str or "rate_limit" in err_str.lower() or "tokens" in err_str.lower()) and attempt == 0:
+                    import re as _re
+                    delay_match = _re.search(r'try again in ([\d\.]+)(m?s)', err_str)
+                    delay = 0.8
+                    if delay_match:
+                        val = float(delay_match.group(1))
+                        unit = delay_match.group(2)
+                        delay = val / 1000.0 if unit == "ms" else val
+                    wait_time = min(max(delay + 0.1, 0.5), 2.0)
+                    logger.info(f"Groq {model} rate limited, waiting {wait_time:.2f}s before fast retry...")
+                    time.sleep(wait_time)
+                    continue
+                logger.warning(f"Groq {model} failed: {e}")
+                break
 
-        usage = response.usage
-        prompt_tokens = usage.prompt_tokens if usage else 0
-        output_tokens = usage.completion_tokens if usage else 0
+    logger.error("All Groq models exhausted")
+    return None
 
-        return GenerationResult(
-            text=result_text,
-            prompt_tokens=prompt_tokens,
-            output_tokens=output_tokens,
-            latency_ms=latency_ms,
-            model=f"{model} (groq fallback)"
-        )
+
+def _openrouter_fallback(
+    prompt: Any,
+    schema: Optional[Any] = None,
+) -> Optional[GenerationResult]:
+    """Fast secondary fallback via OpenRouter API."""
+    try:
+        try:
+            from services.openrouter_service import OpenRouterService
+        except ImportError:
+            from backend.services.openrouter_service import OpenRouterService
+
+        ors = OpenRouterService.get_instance()
+        if ors.available:
+            res = ors.generate(prompt, schema=schema)
+            if res and res.get("text"):
+                raw_text = res["text"]
+                clean_text = extract_clean_json(raw_text) if schema else raw_text
+                return GenerationResult(
+                    text=clean_text,
+                    prompt_tokens=res.get("prompt_tokens", 0),
+                    output_tokens=res.get("output_tokens", 0),
+                    latency_ms=res.get("latency_ms", 0.0),
+                    model=res.get("model", "OpenRouter fallback")
+                )
     except Exception as e:
-        logger.error(f"Groq fallback failed: {e}")
-        return None
+        logger.warning(f"OpenRouter fallback attempt failed: {e}")
+    return None
 
 
 def _fallback_generate(
     prompt: Any,
     schema: Optional[Any] = None,
-    model: str = "gpt-4o"
+    model: str = "fallback"
 ) -> Optional[GenerationResult]:
-    """Fallback generator using unlimited free tier g4f api when Gemini limits are reached.
-    Returns None if g4f is not installed or fails."""
-    if not _g4f_available:
-        logger.warning("g4f not installed — skipping fallback")
-        return None
-    logger.warning("Using g4f (gpt-4o) fallback due to Gemini limits...")
-    try:
-        from g4f.client import Client
-        client = Client()
-        messages = []
-
-        prompt_text = prompt
-        if isinstance(prompt, list):
-            prompt_text = next((item for item in prompt if isinstance(item, str)), "Please analyze the input.")
-
-        if schema:
-            if hasattr(schema, "model_json_schema"):
-                schema_dict = schema.model_json_schema()
-                schema_str = json.dumps(schema_dict, indent=2)
-                sys_msg = (
-                    "You must return ONLY a raw valid JSON object. "
-                    "Do not use markdown code blocks like ```json. "
-                    f"Your JSON must strictly match this schema:\n{schema_str}"
-                )
-                messages.append({"role": "system", "content": sys_msg})
-
-        messages.append({"role": "user", "content": str(prompt_text)})
-
-        start = time.time()
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-        )
-        result_text = response.choices[0].message.content
-        latency_ms = (time.time() - start) * 1000
-
-        if schema:
-            result_text = result_text.strip("` \n")
-            if result_text.startswith("json\n"):
-                result_text = result_text[5:]
-
-        return GenerationResult(
-            text=result_text,
-            prompt_tokens=0,
-            output_tokens=0,
-            latency_ms=latency_ms,
-            model=f"{model} (g4f fallback)"
-        )
-    except Exception as e:
-        logger.error(f"G4F fallback failed: {e}")
-        return None
+    """Fast non-blocking fallback generator. Never hangs."""
+    return None
 
 
 def _run_fallback_chain(
     prompt: Any,
     schema: Optional[Any] = None,
 ) -> Optional[GenerationResult]:
-    """Try fallback providers in order: Groq → g4f. Returns first success or None."""
-    result = _groq_fallback(prompt, schema=schema)
+    """Try fallback providers in order: OpenRouter → Groq. Returns first success or None instantly."""
+    result = _openrouter_fallback(prompt, schema=schema)
     if result is not None:
         return result
-    result = _fallback_generate(prompt, schema=schema)
+    result = _groq_fallback(prompt, schema=schema)
     if result is not None:
         return result
     return None
 
 
-@retry(
-    stop=stop_after_attempt(4),
-    wait=wait_exponential(multiplier=2, min=3, max=30),
-    reraise=True,
-)
+async def _async_openrouter_fallback(
+    prompt: Any,
+    schema: Optional[Any] = None,
+) -> Optional[GenerationResult]:
+    """Fast non-blocking secondary fallback via OpenRouter API."""
+    try:
+        try:
+            from services.openrouter_service import OpenRouterService
+        except ImportError:
+            from backend.services.openrouter_service import OpenRouterService
+
+        ors = OpenRouterService.get_instance()
+        if ors.available:
+            res = await ors.async_generate(prompt, schema=schema)
+            if res and res.get("text"):
+                raw_text = res["text"]
+                clean_text = extract_clean_json(raw_text) if schema else raw_text
+                return GenerationResult(
+                    text=clean_text,
+                    prompt_tokens=res.get("prompt_tokens", 0),
+                    output_tokens=res.get("output_tokens", 0),
+                    latency_ms=res.get("latency_ms", 0.0),
+                    model=res.get("model", "OpenRouter fallback")
+                )
+    except Exception as e:
+        logger.warning(f"OpenRouter async fallback attempt failed: {e}")
+    return None
+
+
+async def _async_run_fallback_chain(
+    prompt: Any,
+    schema: Optional[Any] = None,
+) -> Optional[GenerationResult]:
+    """Try async fallback providers: OpenRouter → Groq. Returns first success or None instantly."""
+    result = await _async_openrouter_fallback(prompt, schema=schema)
+    if result is not None:
+        return result
+    result = await asyncio.to_thread(_groq_fallback, prompt, schema=schema)
+    if result is not None:
+        return result
+    return None
+
+
 def generate(
     prompt: Any,
     schema: Optional[Any] = None,
@@ -528,13 +635,21 @@ def generate(
     tools: Optional[list] = None,
 ) -> GenerationResult:
     """
-    Core generation call with rate limiting, multi-key failover, retry,
-    token tracking, and timing.
-    Raises ValueError if client is unavailable.
-    Raises upstream SDK exceptions on API failure (after all keys exhausted).
+    Core generation call with rate limiting, multi-key failover, token tracking, and timing.
     """
     if not _initialized:
         init_gemini()
+
+    # Fast bypass: if all Gemini keys are on cooldown or unavailable, route directly to fallback with zero semaphore lock
+    client, key_idx = get_client_with_index()
+    if client is None or not _clients or all(c is None for c in _clients):
+        logger.info("All Gemini keys cooling down or exhausted, using fallback chain immediately...")
+        fb = _run_fallback_chain(prompt, schema=schema)
+        if fb is not None:
+            return fb
+        raise ValueError(
+            f"Gemini client not available: {_init_error or 'All keys on cooldown'}"
+        )
 
     last_error = None
     key_attempts = 0
@@ -543,14 +658,10 @@ def generate(
     _gemini_concurrency.acquire()
     try:
         while key_attempts < max_key_attempts:
-            client = get_client()
             if client is None:
-                fb = _run_fallback_chain(prompt, schema=schema)
-                if fb is not None:
-                    return fb
-                raise ValueError(
-                    f"Gemini client not available: {_init_error or 'Unknown error'}"
-                )
+                client, key_idx = get_client_with_index()
+                if client is None:
+                    break
 
             _rate_limiter.sync_wait_if_needed()
 
@@ -564,55 +675,77 @@ def generate(
             if tools:
                 config.tools = tools
 
-            try:
-                start = time.time()
-                response = client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=config,
-                )
-                latency_ms = (time.time() - start) * 1000
+            models_to_try = [model] + [m for m in FALLBACK_MODELS if m != model]
+            for target_model in models_to_try:
+                try:
+                    start = time.time()
+                    response = client.models.generate_content(
+                        model=target_model,
+                        contents=prompt,
+                        config=config,
+                    )
+                    latency_ms = (time.time() - start) * 1000
 
-                prompt_tokens = 0
-                output_tokens = 0
-                if hasattr(response, "usage_metadata") and response.usage_metadata:
-                    usage = response.usage_metadata
-                    prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
-                    output_tokens = getattr(usage, "candidates_token_count", 0) or 0
+                    prompt_tokens = 0
+                    output_tokens = 0
+                    if hasattr(response, "usage_metadata") and response.usage_metadata:
+                        usage = response.usage_metadata
+                        prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
+                        output_tokens = getattr(usage, "candidates_token_count", 0) or 0
 
-                return GenerationResult(
-                    text=response.text if hasattr(response, "text") else "",
-                    prompt_tokens=prompt_tokens,
-                    output_tokens=output_tokens,
-                    latency_ms=latency_ms,
-                    model=model,
-                )
-            except Exception as e:
-                last_error = e
-                error_msg = str(e)
-                key_attempts += 1
+                    raw_text = response.text if hasattr(response, "text") else ""
+                    clean_text = extract_clean_json(raw_text) if schema else raw_text
+
+                    return GenerationResult(
+                        text=clean_text,
+                        prompt_tokens=prompt_tokens,
+                        output_tokens=output_tokens,
+                        latency_ms=latency_ms,
+                        model=target_model,
+                    )
+                except Exception as e:
+                    last_error = e
+                    error_msg = str(e)
+                    if any(err_kw in error_msg for err_kw in ("404", "NOT_FOUND", "503", "UNAVAILABLE", "500", "502", "high demand", "overloaded")):
+                        logger.info(f"Model {target_model} temporary error ({error_msg[:60]}), trying next model...")
+                        continue
+                    break
+
+            key_attempts += 1
+            key_label = f"key #{key_idx + 1}" if key_idx >= 0 else "unknown key"
 
             if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg or "quota" in error_msg.lower():
-                logger.warning(f"Rate limit on key {_current_key_index + 1}, cooling down for {KEY_COOLDOWN_SECONDS}s")
-                _mark_key_cooldown(_current_key_index)
+                cooldown_dur = 60.0 if ("limit: 20" in error_msg or "per day" in error_msg.lower()) else 5.0
+                logger.warning(f"Rate limit on {key_label}, cooling down for {cooldown_dur}s")
+                _mark_key_cooldown(key_idx, duration=cooldown_dur)
                 _rotate_key()
-                if len(_get_available_client_indices()) > 0:
+                client, key_idx = get_client_with_index()
+                if client is not None:
                     continue
-                logger.warning("All keys exhausted on rate limit, attempting fallback chain...")
-                fb = _run_fallback_chain(prompt, schema=schema)
-                if fb is not None:
-                    return fb
-                logger.error("All Gemini keys exhausted AND g4f fallback failed. Raising.")
+                logger.warning("All Gemini keys exhausted on rate limit, switching to fallback chain...")
+                break
+            elif any(err_kw in error_msg for err_kw in ("503", "UNAVAILABLE", "high demand", "overloaded", "500", "502")):
+                logger.warning(f"Temporary server overload on {key_label} ({error_msg[:60]}), cooling down for 3s and rotating...")
+                _mark_key_cooldown(key_idx, duration=3.0)
+                _rotate_key()
+                client, key_idx = get_client_with_index()
+                if client is not None:
+                    continue
                 break
             else:
+                logger.warning(f"Non-rate-limit error on {key_label}: {error_msg[:120]}")
                 _rotate_key()
-                if len(_api_keys) > 1:
+                client, key_idx = get_client_with_index()
+                if client is not None:
                     continue
                 break
     finally:
         _gemini_concurrency.release()
 
-    raise last_error or ValueError("All API keys exhausted")
+    fb = _run_fallback_chain(prompt, schema=schema)
+    if fb is not None:
+        return fb
+    raise last_error or ValueError("All LLM providers exhausted")
 
 
 async def async_generate(
@@ -624,11 +757,21 @@ async def async_generate(
 ) -> GenerationResult:
     """
     Fully async version of generate().
-    Uses async rate limiter directly — never blocks the event loop.
-    Call this from async contexts instead of generate().
+    Bypasses semaphore and rate limiter when keys are exhausted to allow concurrent fallback processing.
     """
     if not _initialized:
         init_gemini()
+
+    # Fast bypass: if all Gemini keys are on cooldown or unavailable, route directly to async fallback without blocking semaphore
+    client, key_idx = get_client_with_index()
+    if client is None or not _clients or all(c is None for c in _clients):
+        logger.info("All Gemini keys cooling down or exhausted, using async fallback chain immediately...")
+        fb = await _async_run_fallback_chain(prompt, schema=schema)
+        if fb is not None:
+            return fb
+        raise ValueError(
+            f"Gemini client not available: {_init_error or 'All keys on cooldown'}"
+        )
 
     last_error = None
     key_attempts = 0
@@ -637,14 +780,10 @@ async def async_generate(
     await asyncio.to_thread(_gemini_concurrency.acquire)
     try:
         while key_attempts < max_key_attempts:
-            client = get_client()
             if client is None:
-                fb = await asyncio.to_thread(_run_fallback_chain, prompt, schema=schema)
-                if fb is not None:
-                    return fb
-                raise ValueError(
-                    f"Gemini client not available: {_init_error or 'Unknown error'}"
-                )
+                client, key_idx = get_client_with_index()
+                if client is None:
+                    break
 
             await _rate_limiter.wait_if_needed()
 
@@ -658,56 +797,78 @@ async def async_generate(
             if tools:
                 config.tools = tools
 
-            try:
-                start = time.time()
-                response = await asyncio.to_thread(
-                    client.models.generate_content,
-                    model=model,
-                    contents=prompt,
-                    config=config,
-                )
-                latency_ms = (time.time() - start) * 1000
+            models_to_try = [model] + [m for m in FALLBACK_MODELS if m != model]
+            for target_model in models_to_try:
+                try:
+                    start = time.time()
+                    response = await asyncio.to_thread(
+                        client.models.generate_content,
+                        model=target_model,
+                        contents=prompt,
+                        config=config,
+                    )
+                    latency_ms = (time.time() - start) * 1000
 
-                prompt_tokens = 0
-                output_tokens = 0
-                if hasattr(response, "usage_metadata") and response.usage_metadata:
-                    usage = response.usage_metadata
-                    prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
-                    output_tokens = getattr(usage, "candidates_token_count", 0) or 0
+                    prompt_tokens = 0
+                    output_tokens = 0
+                    if hasattr(response, "usage_metadata") and response.usage_metadata:
+                        usage = response.usage_metadata
+                        prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
+                        output_tokens = getattr(usage, "candidates_token_count", 0) or 0
 
-                return GenerationResult(
-                    text=response.text if hasattr(response, "text") else "",
-                    prompt_tokens=prompt_tokens,
-                    output_tokens=output_tokens,
-                    latency_ms=latency_ms,
-                    model=model,
-                )
-            except Exception as e:
-                last_error = e
-                error_msg = str(e)
-                key_attempts += 1
+                    raw_text = response.text if hasattr(response, "text") else ""
+                    clean_text = extract_clean_json(raw_text) if schema else raw_text
 
-                if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg or "quota" in error_msg.lower():
-                    logger.warning(f"Rate limit on key {_current_key_index + 1}, cooling down for {KEY_COOLDOWN_SECONDS}s")
-                    _mark_key_cooldown(_current_key_index)
-                    _rotate_key()
-                    if len(_get_available_client_indices()) > 0:
+                    return GenerationResult(
+                        text=clean_text,
+                        prompt_tokens=prompt_tokens,
+                        output_tokens=output_tokens,
+                        latency_ms=latency_ms,
+                        model=target_model,
+                    )
+                except Exception as e:
+                    last_error = e
+                    error_msg = str(e)
+                    if any(err_kw in error_msg for err_kw in ("404", "NOT_FOUND", "503", "UNAVAILABLE", "500", "502", "high demand", "overloaded")):
+                        logger.info(f"Model {target_model} temporary error ({error_msg[:60]}), trying next model...")
                         continue
-                    logger.warning("All keys exhausted on rate limit, attempting fallback chain...")
-                    fb = await asyncio.to_thread(_run_fallback_chain, prompt, schema=schema)
-                    if fb is not None:
-                        return fb
-                    logger.error("All Gemini keys exhausted AND fallback chain failed. Raising.")
                     break
-                else:
-                    _rotate_key()
-                    if len(_api_keys) > 1:
-                        continue
+
+            key_attempts += 1
+            key_label = f"key #{key_idx + 1}" if key_idx >= 0 else "unknown key"
+
+            if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg or "quota" in error_msg.lower():
+                cooldown_dur = 60.0 if ("limit: 20" in error_msg or "per day" in error_msg.lower()) else 5.0
+                logger.warning(f"Rate limit on {key_label}, cooling down for {cooldown_dur}s")
+                _mark_key_cooldown(key_idx, duration=cooldown_dur)
+                _rotate_key()
+                client, key_idx = get_client_with_index()
+                if client is not None:
+                    continue
+                logger.warning("All Gemini keys exhausted on rate limit, switching to async fallback chain...")
+                break
+            elif any(err_kw in error_msg for err_kw in ("503", "UNAVAILABLE", "high demand", "overloaded", "500", "502")):
+                logger.warning(f"Temporary server overload on {key_label} ({error_msg[:60]}), cooling down for 3s and rotating...")
+                _mark_key_cooldown(key_idx, duration=3.0)
+                _rotate_key()
+                client, key_idx = get_client_with_index()
+                if client is not None:
+                    continue
+                break
+            else:
+                logger.warning(f"Non-rate-limit error on {key_label}: {error_msg[:120]}")
+                _rotate_key()
+                client, key_idx = get_client_with_index()
+                if client is not None:
+                    continue
                 break
     finally:
         await asyncio.to_thread(_gemini_concurrency.release)
 
-    raise last_error or ValueError("All API keys exhausted")
+    fb = await _async_run_fallback_chain(prompt, schema=schema)
+    if fb is not None:
+        return fb
+    raise last_error or ValueError("All LLM providers exhausted")
 
 
 async def async_generate_with_vision(
@@ -723,6 +884,16 @@ async def async_generate_with_vision(
     if not _initialized:
         init_gemini()
 
+    client, key_idx = get_client_with_index()
+    if client is None or not _clients or all(c is None for c in _clients):
+        logger.warning("All Gemini keys unavailable/cooldown for vision, trying async fallback chain...")
+        fb = await _async_run_fallback_chain(contents, schema=schema)
+        if fb is not None:
+            return fb
+        raise ValueError(
+            f"Gemini client not available: {_init_error or 'All keys on cooldown'}"
+        )
+
     last_error = None
     key_attempts = 0
     max_key_attempts = max(len(_clients), 1) * 2
@@ -730,14 +901,10 @@ async def async_generate_with_vision(
     await asyncio.to_thread(_gemini_concurrency.acquire)
     try:
         while key_attempts < max_key_attempts:
-            client = get_client()
             if client is None:
-                fb = await asyncio.to_thread(_run_fallback_chain, contents, schema=schema)
-                if fb is not None:
-                    return fb
-                raise ValueError(
-                    f"Gemini client not available: {_init_error or 'Unknown error'}"
-                )
+                client, key_idx = get_client_with_index()
+                if client is None:
+                    break
 
             await _rate_limiter.wait_if_needed()
 
@@ -766,8 +933,11 @@ async def async_generate_with_vision(
                     prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
                     output_tokens = getattr(usage, "candidates_token_count", 0) or 0
 
+                raw_text = response.text if hasattr(response, "text") else ""
+                clean_text = extract_clean_json(raw_text) if schema else raw_text
+
                 return GenerationResult(
-                    text=response.text if hasattr(response, "text") else "",
+                    text=clean_text,
                     prompt_tokens=prompt_tokens,
                     output_tokens=output_tokens,
                     latency_ms=latency_ms,
@@ -777,26 +947,38 @@ async def async_generate_with_vision(
                 last_error = e
                 error_msg = str(e)
                 key_attempts += 1
+                key_label = f"key #{key_idx + 1}" if key_idx >= 0 else "unknown key"
 
                 if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg or "quota" in error_msg.lower():
-                    logger.warning(f"Rate limit on key {_current_key_index + 1}, cooling down for {KEY_COOLDOWN_SECONDS}s")
-                    _mark_key_cooldown(_current_key_index)
+                    cooldown_dur = 60.0 if ("limit: 20" in error_msg or "per day" in error_msg.lower()) else 5.0
+                    logger.warning(f"Rate limit on {key_label}, cooling down for {cooldown_dur}s")
+                    _mark_key_cooldown(key_idx, duration=cooldown_dur)
                     _rotate_key()
-                    if len(_get_available_client_indices()) > 0:
+                    client, key_idx = get_client_with_index()
+                    if client is not None:
                         continue
-                    fb = await asyncio.to_thread(_run_fallback_chain, contents, schema=schema)
-                    if fb is not None:
-                        return fb
-                    logger.error("All Gemini keys exhausted AND fallback chain failed. Raising.")
+                    break
+                elif any(err_kw in error_msg for err_kw in ("503", "UNAVAILABLE", "high demand", "overloaded", "500", "502")):
+                    logger.warning(f"Temporary server overload on {key_label} ({error_msg[:60]}), cooling down for 3s and rotating...")
+                    _mark_key_cooldown(key_idx, duration=3.0)
+                    _rotate_key()
+                    client, key_idx = get_client_with_index()
+                    if client is not None:
+                        continue
                     break
                 else:
+                    logger.warning(f"Non-rate-limit error on {key_label}: {error_msg[:120]}")
                     _rotate_key()
-                    if len(_api_keys) > 1:
+                    client, key_idx = get_client_with_index()
+                    if client is not None:
                         continue
                     break
     finally:
         await asyncio.to_thread(_gemini_concurrency.release)
 
+    fb = await _async_run_fallback_chain(contents, schema=schema)
+    if fb is not None:
+        return fb
     raise last_error or ValueError("All API keys exhausted")
 
 
@@ -813,6 +995,16 @@ def generate_with_vision(
     if not _initialized:
         init_gemini()
 
+    client, key_idx = get_client_with_index()
+    if client is None or not _clients or all(c is None for c in _clients):
+        logger.warning("All Gemini keys unavailable/cooldown for vision, trying fallback chain...")
+        fb = _run_fallback_chain(contents, schema=schema)
+        if fb is not None:
+            return fb
+        raise ValueError(
+            f"Gemini client not available: {_init_error or 'All keys on cooldown'}"
+        )
+
     last_error = None
     key_attempts = 0
     max_key_attempts = max(len(_clients), 1) * 2
@@ -820,14 +1012,10 @@ def generate_with_vision(
     _gemini_concurrency.acquire()
     try:
         while key_attempts < max_key_attempts:
-            client = get_client()
             if client is None:
-                fb = _run_fallback_chain(contents, schema=schema)
-                if fb is not None:
-                    return fb
-                raise ValueError(
-                    f"Gemini client not available: {_init_error or 'Unknown error'}"
-                )
+                client, key_idx = get_client_with_index()
+                if client is None:
+                    break
 
             _rate_limiter.sync_wait_if_needed()
 
@@ -855,8 +1043,11 @@ def generate_with_vision(
                     prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
                     output_tokens = getattr(usage, "candidates_token_count", 0) or 0
 
+                raw_text = response.text if hasattr(response, "text") else ""
+                clean_text = extract_clean_json(raw_text) if schema else raw_text
+
                 return GenerationResult(
-                    text=response.text if hasattr(response, "text") else "",
+                    text=clean_text,
                     prompt_tokens=prompt_tokens,
                     output_tokens=output_tokens,
                     latency_ms=latency_ms,
@@ -866,23 +1057,36 @@ def generate_with_vision(
                 last_error = e
                 error_msg = str(e)
                 key_attempts += 1
+                key_label = f"key #{key_idx + 1}" if key_idx >= 0 else "unknown key"
 
                 if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg or "quota" in error_msg.lower():
-                    logger.warning(f"Rate limit on key {_current_key_index + 1}, cooling down for {KEY_COOLDOWN_SECONDS}s")
-                    _mark_key_cooldown(_current_key_index)
+                    cooldown_dur = 60.0 if ("limit: 20" in error_msg or "per day" in error_msg.lower()) else 5.0
+                    logger.warning(f"Rate limit on {key_label}, cooling down for {cooldown_dur}s")
+                    _mark_key_cooldown(key_idx, duration=cooldown_dur)
                     _rotate_key()
-                    if len(_get_available_client_indices()) > 0:
+                    client, key_idx = get_client_with_index()
+                    if client is not None:
                         continue
-                    fb = _run_fallback_chain(contents, schema=schema)
-                    if fb is not None:
-                        return fb
-                    logger.error("All Gemini keys exhausted AND fallback chain failed. Raising.")
+                    break
+                elif any(err_kw in error_msg for err_kw in ("503", "UNAVAILABLE", "high demand", "overloaded", "500", "502")):
+                    logger.warning(f"Temporary server overload on {key_label} ({error_msg[:60]}), cooling down for 3s and rotating...")
+                    _mark_key_cooldown(key_idx, duration=3.0)
+                    _rotate_key()
+                    client, key_idx = get_client_with_index()
+                    if client is not None:
+                        continue
                     break
                 else:
+                    logger.warning(f"Non-rate-limit error on {key_label}: {error_msg[:120]}")
                     _rotate_key()
-                    if len(_api_keys) > 1:
+                    client, key_idx = get_client_with_index()
+                    if client is not None:
                         continue
+                    break
     finally:
         _gemini_concurrency.release()
 
+    fb = _run_fallback_chain(contents, schema=schema)
+    if fb is not None:
+        return fb
     raise last_error or ValueError("All API keys exhausted")

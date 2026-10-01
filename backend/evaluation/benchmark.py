@@ -30,9 +30,11 @@ class AgentEvaluator:
 
     def __init__(self, log_path: str = "logs/evaluation_report.json"):
         if not hasattr(self, '_initialized'):
+            if os.environ.get("VERCEL"):
+                log_path = "/tmp/evaluation_report.json"
             self.log_path = log_path
             self.trace_data: Dict[str, list] = {}
-            os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+            os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
             self._initialized = True
 
     @classmethod

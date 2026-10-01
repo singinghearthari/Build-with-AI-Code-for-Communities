@@ -33,15 +33,7 @@ class StorageService:
             try:
                 self.client = create_client(url, key)
                 
-                # Auto-create bucket if missing
-                try:
-                    buckets = self.client.storage.list_buckets()
-                    if not any(b.name == self.bucket for b in buckets):
-                        self.client.storage.create_bucket(self.bucket, name=self.bucket, options={"public": True})
-                        logger.info(f"Created missing Supabase bucket: {self.bucket}")
-                except Exception as b_err:
-                    logger.warning(f"Could not verify/create bucket '{self.bucket}': {b_err}")
-
+                self._bucket_verified = False
                 logger.info(f"Supabase Storage initialized (bucket: {self.bucket})")
             except Exception as e:
                 logger.error(f"Supabase initialization failed: {e}")
@@ -83,6 +75,16 @@ class StorageService:
 
         storage_path = f"{user_id}/{filename}"
         mime_type = validation["mime_type"]
+
+        if not getattr(self, "_bucket_verified", False):
+            try:
+                buckets = self.client.storage.list_buckets()
+                if not any(b.name == self.bucket for b in buckets):
+                    self.client.storage.create_bucket(self.bucket, name=self.bucket, options={"public": True})
+                    logger.info(f"Created missing Supabase bucket: {self.bucket}")
+                self._bucket_verified = True
+            except Exception as b_err:
+                logger.warning(f"Could not verify/create bucket '{self.bucket}': {b_err}")
 
         try:
             self.client.storage.from_(self.bucket).upload(

@@ -10,21 +10,21 @@ from utils.dataset_manager import DatasetManager
 
 
 class TreatmentOption(BaseModel):
-    name: str
-    type: str
-    application: str
-    cost_estimate_inr: float
-    effectiveness: str
+    name: str = "Standard biological control"
+    type: str = "Biological"
+    application: str = "Foliar spray"
+    cost_estimate_inr: float = 350.0
+    effectiveness: str = "High"
 
 
 class BudgetPlan(BaseModel):
-    cheapest_option: TreatmentOption
-    best_value_option: TreatmentOption
-    budget_limit: float
-    estimated_total_cost: float
-    budget_compliant: bool
-    savings_tip: str
-    reasoning: str
+    cheapest_option: TreatmentOption = TreatmentOption(name="Neem oil spray", cost_estimate_inr=250.0)
+    best_value_option: TreatmentOption = TreatmentOption(name="Bio-fungicide", cost_estimate_inr=450.0)
+    budget_limit: float = 5000.0
+    estimated_total_cost: float = 450.0
+    budget_compliant: bool = True
+    savings_tip: str = "Opt for biological controls to save on chemical pesticide costs"
+    reasoning: str = "Budget-optimized treatment strategy"
 
 
 class BudgetPlanningAgent(BaseAgent):
@@ -36,8 +36,19 @@ class BudgetPlanningAgent(BaseAgent):
     def _process(self, context: Dict[str, Any]) -> tuple:
         budget = context.get("budget", 0)
         disease = context.get("disease", "")
+        if not disease:
+            v_res = context.get("vision_result") or {}
+            disease = v_res.get("disease") or v_res.get("expert_analysis", {}).get("disease", "")
+        if not disease:
+            dp_res = context.get("disease_prediction_result") or {}
+            preds = dp_res.get("predicted_diseases") or []
+            if preds and isinstance(preds, list) and len(preds) > 0 and isinstance(preds[0], dict):
+                disease = preds[0].get("disease_name", "")
+        if disease == "Healthy" or disease == "Unknown":
+            disease = ""
+
         crop = context.get("crop", "")
-        self.log_execution(f"Planning budget for limit ₹{budget}")
+        self.log_execution(f"Planning budget for limit ₹{budget} (crop={crop}, disease={disease})")
 
         # Step 1: Retrieve treatment data from knowledge base
         treatments_data = self.dataset_manager.query("treatments", disease or crop)

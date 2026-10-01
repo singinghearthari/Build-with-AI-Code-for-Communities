@@ -8,7 +8,7 @@ import requests
 
 logger = logging.getLogger("OpenRouterService")
 
-VISION_MODEL = "google/gemma-4-26b-a4b-it:free"
+VISION_MODEL = "google/gemini-2.5-flash"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
@@ -18,6 +18,8 @@ class OpenRouterService:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self._available = bool(self.api_key)
+        self._session = requests.Session()
+        self._async_client = None
         if not self._available:
             logger.warning("OPENROUTER_API_KEY not set — OpenRouter unavailable")
 
@@ -129,3 +131,142 @@ class OpenRouterService:
         except Exception as e:
             logger.error(f"OpenRouter vision analysis failed: {e}")
             return {"status": "error", "message": str(e)}
+
+    def generate(
+        self,
+        prompt: Any,
+        schema: Optional[Any] = None,
+        model: str = "google/gemini-2.5-flash",
+        max_tokens: int = 800,
+    ) -> Optional[dict]:
+        """Fast API text completion fallback via OpenRouter."""
+        if not self._available:
+            return None
+
+        prompt_text = prompt
+        if isinstance(prompt, list):
+            prompt_text = next((item for item in prompt if isinstance(item, str)), str(prompt))
+
+        messages = []
+        if schema:
+            schema_str = ""
+            if hasattr(schema, "model_json_schema"):
+                schema_str = json.dumps(schema.model_json_schema(), indent=2)
+            elif isinstance(schema, dict):
+                schema_str = json.dumps(schema, indent=2)
+            if schema_str:
+                messages.append({
+                    "role": "system",
+                    "content": f"You must output ONLY valid JSON complying with this JSON Schema:\n{schema_str}\nDo not include any other text or markdown formatting."
+                })
+
+        messages.append({"role": "user", "content": str(prompt_text)})
+
+        try:
+            start = time.time()
+            resp = self._session.post(
+                url=OPENROUTER_URL,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.2,
+                },
+                timeout=12,
+            )
+            latency_ms = (time.time() - start) * 1000
+            if resp.status_code == 200:
+                data = resp.json()
+                text = data["choices"][0]["message"]["content"].strip().strip("` \n")
+                if text.startswith("json\n"):
+                    text = text[5:]
+                usage = data.get("usage", {})
+                return {
+                    "text": text,
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "output_tokens": usage.get("completion_tokens", 0),
+                    "latency_ms": latency_ms,
+                    "model": f"{model} (OpenRouter fallback)",
+                }
+            logger.warning(f"OpenRouter text generation failed with HTTP {resp.status_code}: {resp.text[:150]}")
+            return None
+        except Exception as e:
+            logger.warning(f"OpenRouter generate error: {e}")
+            return None
+
+    async def get_async_client(self):
+        if self._async_client is None or self._async_client.is_closed:
+            import httpx
+            self._async_client = httpx.AsyncClient(timeout=15.0)
+        return self._async_client
+
+    async def async_generate(
+        self,
+        prompt: Any,
+        schema: Optional[Any] = None,
+        model: str = "google/gemini-2.5-flash",
+        max_tokens: int = 800,
+    ) -> Optional[dict]:
+        """Fast non-blocking API text completion via OpenRouter using httpx."""
+        if not self._available:
+            return None
+
+        prompt_text = prompt
+        if isinstance(prompt, list):
+            prompt_text = next((item for item in prompt if isinstance(item, str)), str(prompt))
+
+        messages = []
+        if schema:
+            schema_str = ""
+            if hasattr(schema, "model_json_schema"):
+                schema_str = json.dumps(schema.model_json_schema(), indent=2)
+            elif isinstance(schema, dict):
+                schema_str = json.dumps(schema, indent=2)
+            if schema_str:
+                messages.append({
+                    "role": "system",
+                    "content": f"You must output ONLY valid JSON complying with this JSON Schema:\n{schema_str}\nDo not include any other text or markdown formatting."
+                })
+
+        messages.append({"role": "user", "content": str(prompt_text)})
+
+        try:
+            client = await self.get_async_client()
+            start = time.time()
+            resp = await client.post(
+                url=OPENROUTER_URL,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.2,
+                },
+            )
+            latency_ms = (time.time() - start) * 1000
+            if resp.status_code == 200:
+                data = resp.json()
+                text = data["choices"][0]["message"]["content"].strip().strip("` \n")
+                if text.startswith("json\n"):
+                    text = text[5:]
+                usage = data.get("usage", {})
+                return {
+                    "text": text,
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "output_tokens": usage.get("completion_tokens", 0),
+                    "latency_ms": latency_ms,
+                    "model": f"{model} (OpenRouter async fallback)",
+                }
+            logger.warning(f"OpenRouter async text generation failed with HTTP {resp.status_code}: {resp.text[:150]}")
+            return None
+        except Exception as e:
+            logger.warning(f"OpenRouter async_generate error: {e}")
+            return None
+

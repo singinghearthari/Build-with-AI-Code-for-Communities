@@ -20,7 +20,6 @@ from api.routes import router as api_router
 from api.tts_routes import router as tts_router
 from utils.logger import setup_logger
 from services import gemini_service
-from services.hf_vision_analyzer import HFVisionAnalyzer
 from services.event_bus import EventBus
 from services.persistence_handler import FirestorePersistenceHandler
 from agents.memory_agent import MemoryAgent
@@ -67,18 +66,6 @@ def _validate_config():
     else:
         logger.warning("DATA_GOV_IN_API_KEY not set. Market agent will use Gemini fallback.")
 
-    # Hugging Face API
-    hf_key = os.getenv("HUGGING_FACE_API")
-    if hf_key:
-        logger.info("HUGGING_FACE_API: configured")
-        hf = HFVisionAnalyzer.get_instance()
-        if hf.is_available():
-            logger.info("HF Vision Analyzer: READY")
-        else:
-            logger.warning("HF Vision Analyzer initialized but may fail — check token")
-    else:
-        logger.warning("HUGGING_FACE_API not set. Vision agent will fall back to Gemini Vision.")
-
     # Initialize Gemini singleton
     gemini_service.init_gemini()
     if gemini_service.is_available():
@@ -116,7 +103,11 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],
+    allow_origins=[
+        "http://localhost:3000", 
+        "http://localhost:3001",
+        "https://seed-ai-capstone-project.web.app"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -128,12 +119,10 @@ app.include_router(tts_router, prefix="/api")
 
 @app.get("/")
 def root():
-    hf = HFVisionAnalyzer.get_instance()
     return {
         "status": "SEED AI Backend Active",
         "version": "2.0.0",
         "gemini_available": gemini_service.is_available(),
-        "hf_vision_available": hf.is_available(),
     }
 
 
