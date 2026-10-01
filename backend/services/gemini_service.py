@@ -706,7 +706,7 @@ def generate(
                 except Exception as e:
                     last_error = e
                     error_msg = str(e)
-                    if any(err_kw in error_msg for err_kw in ("404", "NOT_FOUND", "503", "UNAVAILABLE", "500", "502", "high demand", "overloaded")):
+                    if any(err_kw in error_msg.lower() for err_kw in ("404", "not_found", "503", "unavailable", "500", "502", "high demand", "overloaded", "capacity", "no capacity")):
                         logger.info(f"Model {target_model} temporary error ({error_msg[:60]}), trying next model...")
                         continue
                     break
@@ -724,7 +724,7 @@ def generate(
                     continue
                 logger.warning("All Gemini keys exhausted on rate limit, switching to fallback chain...")
                 break
-            elif any(err_kw in error_msg for err_kw in ("503", "UNAVAILABLE", "high demand", "overloaded", "500", "502")):
+            elif any(err_kw in error_msg.lower() for err_kw in ("503", "unavailable", "high demand", "overloaded", "500", "502", "capacity", "no capacity")):
                 logger.warning(f"Temporary server overload on {key_label} ({error_msg[:60]}), cooling down for 3s and rotating...")
                 _mark_key_cooldown(key_idx, duration=3.0)
                 _rotate_key()
@@ -829,7 +829,7 @@ async def async_generate(
                 except Exception as e:
                     last_error = e
                     error_msg = str(e)
-                    if any(err_kw in error_msg for err_kw in ("404", "NOT_FOUND", "503", "UNAVAILABLE", "500", "502", "high demand", "overloaded")):
+                    if any(err_kw in error_msg.lower() for err_kw in ("404", "not_found", "503", "unavailable", "500", "502", "high demand", "overloaded", "capacity", "no capacity")):
                         logger.info(f"Model {target_model} temporary error ({error_msg[:60]}), trying next model...")
                         continue
                     break
@@ -847,7 +847,7 @@ async def async_generate(
                     continue
                 logger.warning("All Gemini keys exhausted on rate limit, switching to async fallback chain...")
                 break
-            elif any(err_kw in error_msg for err_kw in ("503", "UNAVAILABLE", "high demand", "overloaded", "500", "502")):
+            elif any(err_kw in error_msg.lower() for err_kw in ("503", "unavailable", "high demand", "overloaded", "500", "502", "capacity", "no capacity")):
                 logger.warning(f"Temporary server overload on {key_label} ({error_msg[:60]}), cooling down for 3s and rotating...")
                 _mark_key_cooldown(key_idx, duration=3.0)
                 _rotate_key()
@@ -916,63 +916,70 @@ async def async_generate_with_vision(
                 config.response_mime_type = "application/json"
                 config.response_schema = schema
 
-            try:
-                start = time.time()
-                response = await asyncio.to_thread(
-                    client.models.generate_content,
-                    model=model,
-                    contents=contents,
-                    config=config,
-                )
-                latency_ms = (time.time() - start) * 1000
+            models_to_try = [model] + [m for m in VISION_MODELS if m != model]
+            for target_model in models_to_try:
+                try:
+                    start = time.time()
+                    response = await asyncio.to_thread(
+                        client.models.generate_content,
+                        model=target_model,
+                        contents=contents,
+                        config=config,
+                    )
+                    latency_ms = (time.time() - start) * 1000
 
-                prompt_tokens = 0
-                output_tokens = 0
-                if hasattr(response, "usage_metadata") and response.usage_metadata:
-                    usage = response.usage_metadata
-                    prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
-                    output_tokens = getattr(usage, "candidates_token_count", 0) or 0
+                    prompt_tokens = 0
+                    output_tokens = 0
+                    if hasattr(response, "usage_metadata") and response.usage_metadata:
+                        usage = response.usage_metadata
+                        prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
+                        output_tokens = getattr(usage, "candidates_token_count", 0) or 0
 
-                raw_text = response.text if hasattr(response, "text") else ""
-                clean_text = extract_clean_json(raw_text) if schema else raw_text
+                    raw_text = response.text if hasattr(response, "text") else ""
+                    clean_text = extract_clean_json(raw_text) if schema else raw_text
 
-                return GenerationResult(
-                    text=clean_text,
-                    prompt_tokens=prompt_tokens,
-                    output_tokens=output_tokens,
-                    latency_ms=latency_ms,
-                    model=model,
-                )
-            except Exception as e:
-                last_error = e
-                error_msg = str(e)
-                key_attempts += 1
-                key_label = f"key #{key_idx + 1}" if key_idx >= 0 else "unknown key"
-
-                if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg or "quota" in error_msg.lower():
-                    cooldown_dur = 60.0 if ("limit: 20" in error_msg or "per day" in error_msg.lower()) else 5.0
-                    logger.warning(f"Rate limit on {key_label}, cooling down for {cooldown_dur}s")
-                    _mark_key_cooldown(key_idx, duration=cooldown_dur)
-                    _rotate_key()
-                    client, key_idx = get_client_with_index()
-                    if client is not None:
+                    return GenerationResult(
+                        text=clean_text,
+                        prompt_tokens=prompt_tokens,
+                        output_tokens=output_tokens,
+                        latency_ms=latency_ms,
+                        model=target_model,
+                    )
+                except Exception as e:
+                    last_error = e
+                    error_msg = str(e)
+                    if any(err_kw in error_msg.lower() for err_kw in ("404", "not_found", "503", "unavailable", "500", "502", "high demand", "overloaded", "capacity", "no capacity")):
+                        logger.info(f"Vision model {target_model} temporary error ({error_msg[:60]}), trying next model...")
                         continue
                     break
-                elif any(err_kw in error_msg for err_kw in ("503", "UNAVAILABLE", "high demand", "overloaded", "500", "502")):
-                    logger.warning(f"Temporary server overload on {key_label} ({error_msg[:60]}), cooling down for 3s and rotating...")
-                    _mark_key_cooldown(key_idx, duration=3.0)
-                    _rotate_key()
-                    client, key_idx = get_client_with_index()
-                    if client is not None:
-                        continue
-                    break
-                else:
-                    logger.warning(f"Non-rate-limit error on {key_label}: {error_msg[:120]}")
-                    _rotate_key()
-                    client, key_idx = get_client_with_index()
-                    if client is not None:
-                        continue
-                    break
+
+            key_attempts += 1
+            key_label = f"key #{key_idx + 1}" if key_idx >= 0 else "unknown key"
+
+            if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg or "quota" in error_msg.lower():
+                cooldown_dur = 60.0 if ("limit: 20" in error_msg or "per day" in error_msg.lower()) else 5.0
+                logger.warning(f"Rate limit on {key_label}, cooling down for {cooldown_dur}s")
+                _mark_key_cooldown(key_idx, duration=cooldown_dur)
+                _rotate_key()
+                client, key_idx = get_client_with_index()
+                if client is not None:
+                    continue
+                break
+            elif any(err_kw in error_msg.lower() for err_kw in ("503", "unavailable", "high demand", "overloaded", "500", "502", "capacity", "no capacity")):
+                logger.warning(f"Temporary server overload on {key_label} ({error_msg[:60]}), cooling down for 3s and rotating...")
+                _mark_key_cooldown(key_idx, duration=3.0)
+                _rotate_key()
+                client, key_idx = get_client_with_index()
+                if client is not None:
+                    continue
+                break
+            else:
+                logger.warning(f"Non-rate-limit error on {key_label}: {error_msg[:120]}")
+                _rotate_key()
+                client, key_idx = get_client_with_index()
+                if client is not None:
+                    continue
+                break
     finally:
         await asyncio.to_thread(_gemini_concurrency.release)
 
@@ -1027,62 +1034,69 @@ def generate_with_vision(
                 config.response_mime_type = "application/json"
                 config.response_schema = schema
 
-            try:
-                start = time.time()
-                response = client.models.generate_content(
-                    model=model,
-                    contents=contents,
-                    config=config,
-                )
-                latency_ms = (time.time() - start) * 1000
+            models_to_try = [model] + [m for m in VISION_MODELS if m != model]
+            for target_model in models_to_try:
+                try:
+                    start = time.time()
+                    response = client.models.generate_content(
+                        model=target_model,
+                        contents=contents,
+                        config=config,
+                    )
+                    latency_ms = (time.time() - start) * 1000
 
-                prompt_tokens = 0
-                output_tokens = 0
-                if hasattr(response, "usage_metadata") and response.usage_metadata:
-                    usage = response.usage_metadata
-                    prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
-                    output_tokens = getattr(usage, "candidates_token_count", 0) or 0
+                    prompt_tokens = 0
+                    output_tokens = 0
+                    if hasattr(response, "usage_metadata") and response.usage_metadata:
+                        usage = response.usage_metadata
+                        prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
+                        output_tokens = getattr(usage, "candidates_token_count", 0) or 0
 
-                raw_text = response.text if hasattr(response, "text") else ""
-                clean_text = extract_clean_json(raw_text) if schema else raw_text
+                    raw_text = response.text if hasattr(response, "text") else ""
+                    clean_text = extract_clean_json(raw_text) if schema else raw_text
 
-                return GenerationResult(
-                    text=clean_text,
-                    prompt_tokens=prompt_tokens,
-                    output_tokens=output_tokens,
-                    latency_ms=latency_ms,
-                    model=model,
-                )
-            except Exception as e:
-                last_error = e
-                error_msg = str(e)
-                key_attempts += 1
-                key_label = f"key #{key_idx + 1}" if key_idx >= 0 else "unknown key"
-
-                if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg or "quota" in error_msg.lower():
-                    cooldown_dur = 60.0 if ("limit: 20" in error_msg or "per day" in error_msg.lower()) else 5.0
-                    logger.warning(f"Rate limit on {key_label}, cooling down for {cooldown_dur}s")
-                    _mark_key_cooldown(key_idx, duration=cooldown_dur)
-                    _rotate_key()
-                    client, key_idx = get_client_with_index()
-                    if client is not None:
+                    return GenerationResult(
+                        text=clean_text,
+                        prompt_tokens=prompt_tokens,
+                        output_tokens=output_tokens,
+                        latency_ms=latency_ms,
+                        model=target_model,
+                    )
+                except Exception as e:
+                    last_error = e
+                    error_msg = str(e)
+                    if any(err_kw in error_msg.lower() for err_kw in ("404", "not_found", "503", "unavailable", "500", "502", "high demand", "overloaded", "capacity", "no capacity")):
+                        logger.info(f"Vision model {target_model} temporary error ({error_msg[:60]}), trying next model...")
                         continue
                     break
-                elif any(err_kw in error_msg for err_kw in ("503", "UNAVAILABLE", "high demand", "overloaded", "500", "502")):
-                    logger.warning(f"Temporary server overload on {key_label} ({error_msg[:60]}), cooling down for 3s and rotating...")
-                    _mark_key_cooldown(key_idx, duration=3.0)
-                    _rotate_key()
-                    client, key_idx = get_client_with_index()
-                    if client is not None:
-                        continue
-                    break
-                else:
-                    logger.warning(f"Non-rate-limit error on {key_label}: {error_msg[:120]}")
-                    _rotate_key()
-                    client, key_idx = get_client_with_index()
-                    if client is not None:
-                        continue
-                    break
+
+            key_attempts += 1
+            key_label = f"key #{key_idx + 1}" if key_idx >= 0 else "unknown key"
+
+            if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg or "quota" in error_msg.lower():
+                cooldown_dur = 60.0 if ("limit: 20" in error_msg or "per day" in error_msg.lower()) else 5.0
+                logger.warning(f"Rate limit on {key_label}, cooling down for {cooldown_dur}s")
+                _mark_key_cooldown(key_idx, duration=cooldown_dur)
+                _rotate_key()
+                client, key_idx = get_client_with_index()
+                if client is not None:
+                    continue
+                break
+            elif any(err_kw in error_msg.lower() for err_kw in ("503", "unavailable", "high demand", "overloaded", "500", "502", "capacity", "no capacity")):
+                logger.warning(f"Temporary server overload on {key_label} ({error_msg[:60]}), cooling down for 3s and rotating...")
+                _mark_key_cooldown(key_idx, duration=3.0)
+                _rotate_key()
+                client, key_idx = get_client_with_index()
+                if client is not None:
+                    continue
+                break
+            else:
+                logger.warning(f"Non-rate-limit error on {key_label}: {error_msg[:120]}")
+                _rotate_key()
+                client, key_idx = get_client_with_index()
+                if client is not None:
+                    continue
+                break
     finally:
         _gemini_concurrency.release()
 
