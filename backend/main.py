@@ -106,8 +106,10 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000", 
         "http://localhost:3001",
-        "https://seed-ai-capstone-project.web.app"
+        "https://seed-ai-capstone-project.web.app",
+        "https://seed-ai-capstone-project.firebaseapp.com"
     ],
+    allow_origin_regex=r"https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

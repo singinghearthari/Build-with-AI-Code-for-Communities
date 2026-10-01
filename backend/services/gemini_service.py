@@ -16,7 +16,7 @@ import time
 import asyncio
 import logging
 import threading
-from typing import Any, Optional, List
+from typing import Any, Optional, List, Tuple
 from google import genai
 from google.genai import types
 from tenacity import (
