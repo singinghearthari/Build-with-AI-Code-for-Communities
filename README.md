@@ -579,8 +579,6 @@ SEED AI is built with trustworthy AI as a first-class principle — not an after
 
 ## 🌱 Built With Purpose
 
-*SEED AI was built for the **Google AI Agents: Intensive Vibe Coding Capstone — July 2026**.*
-
 *It demonstrates that modern AI agents — given planning, reasoning, tool use, memory, reflection, guardrails, and collaboration — can move beyond answering questions to making real decisions that improve lives.*
 
 <br/>
